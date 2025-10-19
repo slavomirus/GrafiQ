@@ -1,0 +1,17 @@
+# Ignoruj wirtualne środowiska Pythona
+.venv
+venv/
+env/
+
+# Ignoruj cache Pythona
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignoruj pliki IDE
+.vscode/
+.idea/
+
+# Ignoruj pliki tymczasowe i logi
+*.log
+.DS_Store

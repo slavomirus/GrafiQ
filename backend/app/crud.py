@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date, time
 from bson import ObjectId
 from typing import List, Optional, Union
 import motor.motor_asyncio
@@ -6,6 +6,7 @@ import re
 import secrets
 import string
 from passlib.context import CryptContext
+from collections import defaultdict
 
 from . import models, schemas
 from .database import get_db # 🟢 Importujemy tylko get_db
@@ -34,6 +35,77 @@ def validate_phone_number(phone: str) -> bool:
 def generate_secure_password() -> str:
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
     return ''.join(secrets.choice(alphabet) for _ in range(12))
+
+async def get_schedule_entry_by_id(db: motor.motor_asyncio.AsyncIOMotorDatabase, shift_id: ObjectId) -> Optional[dict]:
+    """Pobiera pojedynczy wpis grafiku na podstawie jego ID."""
+    return await db.schedule.find_one({"_id": shift_id})
+
+async def create_leave(db: motor.motor_asyncio.AsyncIOMotorDatabase, user_id: ObjectId, leave_data: schemas.L4LeaveRequest) -> dict:
+    """Tworzy nowy wpis o zwolnieniu L4 w bazie danych."""
+    leave_doc = {
+        "user_id": user_id,
+        "type": models.LeaveType.L4.value,
+        "start_date": datetime.combine(leave_data.startDate, time.min),
+        "end_date": datetime.combine(leave_data.endDate, time.max),
+        "submitted_at": datetime.utcnow()
+    }
+    result = await db.leaves.insert_one(leave_doc)
+    return await db.leaves.find_one({"_id": result.inserted_id})
+
+async def delete_schedule_entries_for_user(db: motor.motor_asyncio.AsyncIOMotorDatabase, user_id: ObjectId, start_date: date, end_date: date) -> int:
+    """Usuwa wszystkie wpisy w grafiku dla danego użytkownika w podanym zakresie dat."""
+    start_datetime = datetime.combine(start_date, time.min)
+    end_datetime = datetime.combine(end_date, time.max)
+    
+    delete_result = await db.schedule.delete_many({
+        "user_id": user_id,
+        "date": {"$gte": start_datetime, "$lte": end_datetime}
+    })
+    return delete_result.deleted_count
+
+async def get_schedule_for_date_range(db: motor.motor_asyncio.AsyncIOMotorDatabase, franchise_code: str, start_date: date, end_date: date) -> List[schemas.ScheduleDayResponse]:
+    """Pobiera i agreguje grafik dla danego sklepu i zakresu dat."""
+    start_datetime = datetime.combine(start_date, time.min)
+    end_datetime = datetime.combine(end_date, time.max)
+
+    shifts_cursor = db.schedule.find({
+        "franchise_code": franchise_code,
+        "date": {"$gte": start_datetime, "$lte": end_datetime}
+    })
+
+    user_ids = set()
+    raw_shifts = await shifts_cursor.to_list(length=None)
+    for shift in raw_shifts:
+        user_ids.add(shift["user_id"])
+
+    users_cursor = db.users.find({"_id": {"$in": list(user_ids)}})
+    users_map = {user["_id"]: schemas.ShiftEmployeeResponse(**user) async for user in users_cursor}
+
+    schedule_by_day = defaultdict(lambda: defaultdict(lambda: {"employees": []}))
+    for shift in raw_shifts:
+        shift_date = shift["date"].date()
+        shift_name = shift.get("shift_name", "unknown")
+        
+        if not schedule_by_day[shift_date][shift_name].get("start_time"):
+            schedule_by_day[shift_date][shift_name]["start_time"] = shift["start_time"]
+            schedule_by_day[shift_date][shift_name]["end_time"] = shift["end_time"]
+        
+        employee_data = users_map.get(shift["user_id"])
+        if employee_data:
+            schedule_by_day[shift_date][shift_name]["employees"].append(employee_data)
+
+    response = []
+    current_date = start_date
+    while current_date <= end_date:
+        day_data = schedule_by_day.get(current_date, {})
+        day_shifts = {}
+        for shift_name, shift_details in day_data.items():
+            day_shifts[shift_name] = schemas.ShiftDetailResponse(**shift_details)
+        
+        response.append(schemas.ScheduleDayResponse(date=current_date, shifts=day_shifts))
+        current_date += timedelta(days=1)
+        
+    return response
 
 # User CRUD Operations
 class UserCRUD:
@@ -128,7 +200,7 @@ class AvailabilityCRUD:
     async def create_availability(db: motor.motor_asyncio.AsyncIOMotorClient, availability: schemas.AvailabilityCreate, user_id: str):
         availability_dict = {
             "user_id": ObjectId(user_id),
-            "date": availability.date,
+            "date": datetime.combine(availability.date, time.min),
             "start_time": availability.start_time,
             "end_time": availability.end_time,
             "period_type": availability.period_type.value,
@@ -154,10 +226,12 @@ class AvailabilityCRUD:
         return await db.availability.find_one({"_id": ObjectId(availability_id)})
 
     @staticmethod
-    async def get_availability_by_user_and_date(db: motor.motor_asyncio.AsyncIOMotorClient, user_id: str, date: datetime.date):
+    async def get_availability_by_user_and_date(db: motor.motor_asyncio.AsyncIOMotorClient, user_id: str, date: date):
+        start_of_day = datetime.combine(date, time.min)
+        end_of_day = datetime.combine(date, time.max)
         return await db.availability.find_one({
             "user_id": ObjectId(user_id),
-            "date": date
+            "date": {"$gte": start_of_day, "$lte": end_of_day}
         })
 
     @staticmethod
@@ -192,8 +266,8 @@ class VacationCRUD:
     async def create_vacation_request(db: motor.motor_asyncio.AsyncIOMotorClient, vacation: schemas.VacationCreate, user_id: str):
         vacation_dict = {
             "user_id": ObjectId(user_id),
-            "start_date": vacation.start_date,
-            "end_date": vacation.end_date,
+            "start_date": datetime.combine(vacation.start_date, time.min),
+            "end_date": datetime.combine(vacation.end_date, time.max),
             "reason": vacation.reason,
             "status": models.VacationStatus.PENDING.value,
             "submitted_at": datetime.utcnow()
@@ -244,7 +318,7 @@ class DeadlineCRUD:
     async def create_deadline(db: motor.motor_asyncio.AsyncIOMotorClient, deadline: schemas.DeadlineCreate):
         deadline_dict = {
             "period_type": deadline.period_type.value,
-            "deadline_date": deadline.deadline_date,
+            "deadline_date": datetime.combine(deadline.deadline_date, time.min),
             "created_at": datetime.utcnow()
         }
         result = await db.deadlines.insert_one(deadline_dict)

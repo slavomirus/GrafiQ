@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "uvicorn": "^0.0.1-security",
     "web-vitals": "^5.1.0"
   },
   "devDependencies": {

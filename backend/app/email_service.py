@@ -2,10 +2,21 @@ from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 from typing import Optional, List
 import os
 import logging
+from pathlib import Path
 from .config import settings
 
 # Konfiguracja logowania
 logger = logging.getLogger(__name__)
+
+# Ustalanie ścieżki do folderu templates
+# Pobieramy ścieżkę do katalogu, w którym znajduje się ten plik (backend/app)
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATE_FOLDER = BASE_DIR / "templates"
+
+# Upewnij się, że folder istnieje, jeśli nie - użyj bieżącego katalogu jako fallback (choć to i tak rzuci błąd jeśli folderu nie ma)
+if not TEMPLATE_FOLDER.exists():
+    logger.warning(f"Folder szablonów nie istnieje: {TEMPLATE_FOLDER}. Próba użycia ścieżki względnej.")
+    TEMPLATE_FOLDER = Path("app/templates")
 
 # Konfiguracja email (użyj zmiennych środowiskowych)
 conf = ConnectionConfig(
@@ -17,7 +28,7 @@ conf = ConnectionConfig(
     MAIL_FROM_NAME=settings.MAIL_FROM_NAME,
     MAIL_STARTTLS=settings.MAIL_STARTTLS,
     MAIL_SSL_TLS=settings.MAIL_SSL_TLS,
-    TEMPLATE_FOLDER="app/templates",
+    TEMPLATE_FOLDER=str(TEMPLATE_FOLDER), # Konwersja Path na str
 )
 
 fm = FastMail(conf)
@@ -234,3 +245,4 @@ async def send_vacation_status_email(email: str, first_name: str, vacation_data:
 
     except Exception as e:
         logger.error(f"Błąd wysyłania emaila statusu urlopu do {email}: {e}")
+        raise

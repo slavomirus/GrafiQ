@@ -402,10 +402,11 @@ class UserResponse(UserBase):
     monthly_hours_target: Optional[int] = None
     employment_start_date: Optional[datetime] = None
     agreements: Optional[Agreements] = None
-    free_access_until: Optional[datetime] = None
+    ### GOD MODE ###
+    free_access_until: Optional[datetime] = free_access_until: Optional[datetime] = Field(default_factory=lambda: datetime.utcnow() + timedelta(days=3650))
     ### GOD MODE ###
     is_subscription_active: Optional[bool] = True
-    subscription_plan: Optional[str] = None
+    subscription_plan: Optional[str] = "unlimited_free_trial"
 
     class Config(MongoConfig):
         pass

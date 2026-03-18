@@ -141,7 +141,7 @@ async def get_current_active_user(
             now = datetime.utcnow()
             has_free_access = free_access_until and free_access_until > now
             
-            is_access_valid = has_free_access or is_subscription_active
+            is_access_valid = True #has_free_access or is_subscription_active
 
             if not is_access_valid:
                 if role == models.UserRole.FRANCHISEE.value:

@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel, EmailStr, SecretStr, Field, field_validator, model_validator, field_serializer
 from enum import Enum
-from datetime import date, time, datetime
+from datetime import date, time, datetime, timedelta
 from typing import Optional, List, Dict, Any, Union
 from bson import ObjectId
 
@@ -403,7 +403,8 @@ class UserResponse(UserBase):
     employment_start_date: Optional[datetime] = None
     agreements: Optional[Agreements] = None
     free_access_until: Optional[datetime] = None
-    is_subscription_active: Optional[bool] = False
+    ### GOD MODE ###
+    is_subscription_active: Optional[bool] = True
     subscription_plan: Optional[str] = None
 
     class Config(MongoConfig):

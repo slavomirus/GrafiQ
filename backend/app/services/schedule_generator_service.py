@@ -322,6 +322,9 @@ class ScheduleGenerator:
         await self._gather_data(start_date, end_date)
         conflicts: List[str] = []
         
+        # Przetasowanie bazy kandydatów na start, by zapewnić różnorodność ("solver" niedeterministyczny)
+        random.shuffle(self.employees)
+        
         uop_employees = [e for e in self.employees if e.get("contract_type") == models.ContractType.UOP.value]
         uz_employees = [e for e in self.employees if e.get("contract_type") == models.ContractType.UZ.value]
         
@@ -346,10 +349,13 @@ class ScheduleGenerator:
                 continue
 
             is_promo_change_day = (curr - PROMO_REFERENCE_DATE).days % 14 == 0
+            closing_needs = self.store_settings.get("employees_on_promo_change", 2) if is_promo_change_day else self.store_settings.get("employees_per_closing_shift", 1)
+            
+            # HARD CONSTRAINT: Wymuszamy minimum 1 osobę na otwarciu i zamknięciu
             needs = {
-                schemas.ShiftType.MORNING.value: self.store_settings.get("employees_per_morning_shift", 1),
-                schemas.ShiftType.MIDDLE.value: self.store_settings.get("employees_per_middle_shift", 0),
-                schemas.ShiftType.CLOSING.value: self.store_settings.get("employees_on_promo_change", 2) if is_promo_change_day else self.store_settings.get("employees_per_closing_shift", 1)
+                schemas.ShiftType.MORNING.value: max(1, int(self.store_settings.get("employees_per_morning_shift", 1))),
+                schemas.ShiftType.MIDDLE.value: max(0, int(self.store_settings.get("employees_per_middle_shift", 0))),
+                schemas.ShiftType.CLOSING.value: max(1, int(closing_needs))
             }
             
             for shift_name, count in needs.items():
@@ -361,11 +367,30 @@ class ScheduleGenerator:
                         global_standard_shifts.append(shift_info)
             curr += timedelta(days=1)
 
-        global_critical_shifts.sort(key=lambda x: x["date"])
-        global_standard_shifts.sort(key=lambda x: x["date"])
+        # Mieszamy nieznacznie kolejność przydzielania zmian krytycznych tego samego dnia,
+        # co też doda więcej losowości na krawędzi dostępności pracowników
+        day_critical_shifts = defaultdict(list)
+        for shift in global_critical_shifts:
+            day_critical_shifts[shift["date"]].append(shift)
+            
+        global_critical_shifts_shuffled = []
+        for d in sorted(day_critical_shifts.keys()):
+            shifts_today = day_critical_shifts[d]
+            random.shuffle(shifts_today)
+            global_critical_shifts_shuffled.extend(shifts_today)
+
+        day_standard_shifts = defaultdict(list)
+        for shift in global_standard_shifts:
+            day_standard_shifts[shift["date"]].append(shift)
+            
+        global_standard_shifts_shuffled = []
+        for d in sorted(day_standard_shifts.keys()):
+            shifts_today = day_standard_shifts[d]
+            random.shuffle(shifts_today)
+            global_standard_shifts_shuffled.extend(shifts_today)
 
         # Generowanie zmian krytycznych
-        for shift in global_critical_shifts:
+        for shift in global_critical_shifts_shuffled:
             current_date = shift["date"]
             shift_name = shift["name"]
             day_str = current_date.isoformat()
@@ -388,6 +413,8 @@ class ScheduleGenerator:
                 if self._is_working_on_day(uid, current_date): continue
                 if self._check_hard_constraints(uid, current_date, shift_name):
                     score = self._calculate_score(uid, current_date, shift_name)
+                    # Wprowadzamy szum losowy, aby solver nie był deterministyczny
+                    score += random.uniform(-3.0, 3.0)
                     valid_candidates.append((uid, priority, score))
             
             valid_candidates.sort(key=lambda x: (x[1], -x[2], random.random()))
@@ -396,10 +423,25 @@ class ScheduleGenerator:
                 selected_uid = valid_candidates[0][0]
                 self._assign_employee(selected_uid, current_date, shift_name)
             else:
-                conflicts.append(f"[KRYTYCZNE] Dnia {day_str} brakuje pracownika na zmianie '{shift_name}'.")
+                # FALLBACK: HARD CONSTRAINT - Nie wolno pominąć zmiany zamykającej/otwierającej. 
+                # Znajdź pracownika, który dziś nie pracuje i nie ma urlopu
+                emergency_candidates = []
+                for uid, priority in candidates:
+                    if not self._is_working_on_day(uid, current_date):
+                        if current_date not in self.vacations.get(uid, []):
+                            emergency_candidates.append(uid)
+                
+                if emergency_candidates:
+                    # Sortujemy po najmniejszej liczbie przepracowanych dotychczas godzin
+                    emergency_candidates.sort(key=lambda u: self.employee_state[u]["hours"])
+                    selected_uid = emergency_candidates[0]
+                    self._assign_employee(selected_uid, current_date, shift_name)
+                    conflicts.append(f"[KRYTYCZNE - WYMUSZONO] Dnia {day_str} awaryjnie przypisano pracownika na zmianę '{shift_name}', łamiąc miękkie reguły odpoczynku/preferencji, by zapewnić obsadę.")
+                else:
+                    conflicts.append(f"[KRYTYCZNE - FATAL] Dnia {day_str} CAŁKOWITY BRAK pracownika na zmianę '{shift_name}'. Wszyscy są przypisani lub mają urlop.")
 
         # Generowanie zmian standardowych
-        for shift in global_standard_shifts:
+        for shift in global_standard_shifts_shuffled:
             current_date = shift["date"]
             shift_name = shift["name"]
             day_str = current_date.isoformat()
@@ -422,6 +464,7 @@ class ScheduleGenerator:
                 if self._is_working_on_day(uid, current_date): continue
                 if self._check_hard_constraints(uid, current_date, shift_name):
                     score = self._calculate_score(uid, current_date, shift_name)
+                    score += random.uniform(-3.0, 3.0)
                     valid_candidates.append((uid, priority, score))
             
             valid_candidates.sort(key=lambda x: (x[1], -x[2], random.random()))
@@ -430,7 +473,20 @@ class ScheduleGenerator:
                 selected_uid = valid_candidates[0][0]
                 self._assign_employee(selected_uid, current_date, shift_name)
             else:
-                conflicts.append(f"Dnia {day_str} brakuje pracownika na zmianie '{shift_name}'.")
+                # W zmianach standardowych też używamy fallbacku
+                emergency_candidates = []
+                for uid, priority in candidates:
+                    if not self._is_working_on_day(uid, current_date):
+                        if current_date not in self.vacations.get(uid, []):
+                            emergency_candidates.append(uid)
+                
+                if emergency_candidates:
+                    emergency_candidates.sort(key=lambda u: self.employee_state[u]["hours"])
+                    selected_uid = emergency_candidates[0]
+                    self._assign_employee(selected_uid, current_date, shift_name)
+                    conflicts.append(f"[WYMUSZONO] Dnia {day_str} awaryjnie przypisano pracownika na zmianę '{shift_name}'.")
+                else:
+                    conflicts.append(f"Dnia {day_str} brakuje pracownika na zmianie '{shift_name}'.")
 
         # BUDOWA KOŃCOWEGO JSONA
         final_schedule_for_json = {}

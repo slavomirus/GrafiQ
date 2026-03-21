@@ -121,7 +121,7 @@ async def login_for_access_token(login_data: schemas.LoginRequest,
     if not user or not security.verify_password(login_data.password, user.get("hashed_password", "")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
+            detail="Niepoprawny e-mail lub hasło.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 

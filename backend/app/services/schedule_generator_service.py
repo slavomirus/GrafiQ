@@ -9,536 +9,459 @@ from bson import ObjectId
 from fastapi import HTTPException, status
 import random
 import calendar
+import holidays
+from dataclasses import dataclass, field
 
 from .. import models, schemas
 from .schedule_service import get_store_settings_and_holidays, resolve_shift_hours
 
 logger = logging.getLogger(__name__)
 
-POLISH_HOLIDAYS = [(1, 1), (1, 6), (5, 1), (5, 3), (8, 15), (11, 1), (11, 11), (12, 25), (12, 26)]
 PROMO_REFERENCE_DATE = date(2025, 9, 23)
+
+@dataclass
+class TimeRange:
+    start: datetime
+    end: datetime
+
+    def overlaps(self, other: 'TimeRange') -> bool:
+        # Dwie zmiany nakładają się na siebie, jeśli start jednej jest przed końcem drugiej (i vice versa)
+        return max(self.start, other.start) < min(self.end, other.end)
+
+    @property
+    def hours(self) -> float:
+        return (self.end - self.start).total_seconds() / 3600.0
+
+@dataclass
+class ShiftDemand:
+    id: str
+    time_range: TimeRange
+    required_employees: int
+    shift_type: str
+
+@dataclass
+class Employee:
+    id: str
+    db_id: ObjectId
+    first_name: str
+    last_name: str
+    contract_type: str
+    fte_or_target: float
+    
+    # Input Constraints
+    unavailabilities: List[TimeRange] = field(default_factory=list)
+    requested_shifts: Dict[date, str] = field(default_factory=dict)
+    preferences: Dict[str, Any] = field(default_factory=dict) 
+    
+    # Stan wewnętrzny algorytmu (Solver State)
+    assigned_shifts: List[ShiftDemand] = field(default_factory=list)
+    target_hours: float = 0.0
+    worked_hours: float = 0.0
+
+    @property
+    def remaining_hours(self) -> float:
+        return self.target_hours - self.worked_hours
+
+def calculate_uop_hours(year: int, month: int, fte: float) -> float:
+    """
+    Wzór z art. 130 KP:
+    1. (tygodnie pełne * 40h) + (pozostałe dni wystające od pon-pt * 8h)
+    2. Odejmujemy 8h za każde święto wypadające w innym dniu niż niedziela.
+    """
+    pl_holidays = holidays.Poland(years=year)
+    first_weekday, num_days = calendar.monthrange(year, month)
+    
+    full_weeks = num_days // 7
+    remaining_days = num_days % 7
+    
+    work_hours = full_weeks * 40
+    for i in range(remaining_days):
+        current_weekday = (first_weekday + i) % 7
+        if current_weekday < 5:  # 0 to poniedziałek, 4 to piątek
+            work_hours += 8
+            
+    for day in range(1, num_days + 1):
+        dt = date(year, month, day)
+        if dt in pl_holidays:
+            if dt.weekday() != 6:
+                work_hours -= 8
+                
+    return work_hours * fte
 
 class ScheduleGenerator:
     def __init__(self, db: motor.motor_asyncio.AsyncIOMotorDatabase, current_user: dict):
         self.db = db
         self.franchise_code = current_user.get("franchise_code")
         self.franchisee = current_user
-        self.employees: List[Dict[str, Any]] = []
+        
         self.store_settings: Dict[str, Any] = {}
         self.holidays_map: Dict[str, Any] = {}
         
-        self.vacations: Dict[ObjectId, List[date]] = defaultdict(list)
-        self.availabilities: Dict[ObjectId, Dict[date, Any]] = defaultdict(dict)
+        self.db_employees: List[Dict[str, Any]] = []
+        self.db_vacations: List[Dict[str, Any]] = []
+        self.db_availabilities: List[Dict[str, Any]] = []
         
-        self.schedule: Dict[date, Dict[str, List[ObjectId]]] = defaultdict(lambda: defaultdict(list))
-        
-        self.employee_state: Dict[ObjectId, Dict[str, Any]] = defaultdict(lambda: {
-            "hours": 0.0
-        })
-        
-        self.employee_map: Dict[str, Dict[str, Any]] = {}
-        self.employees_by_id: Dict[ObjectId, Dict[str, Any]] = {}
+        self.employees: List[Employee] = []
+        self.demands: List[ShiftDemand] = []
+        self.logs: List[str] = []
 
     async def _gather_data(self, start_date: date, end_date: date):
-        logger.info(f"Rozpoczynanie zbierania danych dla grafiku ({self.franchise_code}) od {start_date} do {end_date}")
-        
         self.store_settings, self.holidays_map = await get_store_settings_and_holidays(self.db, self.franchise_code)
         
-        self.employees = await self.db.users.find({
+        self.db_employees = await self.db.users.find({
             "franchise_code": self.franchise_code,
             "role": models.UserRole.EMPLOYEE.value,
             "status": models.UserStatus.ACTIVE.value
         }).to_list(length=None)
         
-        if not self.employees:
-            raise ValueError("Brak aktywnych pracowników do wygenerowania grafiku.")
-        
-        for emp in self.employees:
-            self.employee_map[str(emp["_id"])] = {
-                "id": str(emp["_id"]),
-                "first_name": emp.get("first_name", ""),
-                "last_name": emp.get("last_name", "")
-            }
-            self.employees_by_id[emp["_id"]] = emp
+        # Właściciel też jest pracownikiem na potrzeby grafiku
+        self.db_employees.append(self.franchisee)
 
-        self.employee_map[str(self.franchisee["_id"])] = {
-            "id": str(self.franchisee["_id"]),
-            "first_name": self.franchisee.get("first_name", ""),
-            "last_name": self.franchisee.get("last_name", "")
-        }
-        self.employees_by_id[self.franchisee["_id"]] = self.franchisee
-
-        employee_ids = [emp["_id"] for emp in self.employees]
-        employee_ids.append(self.franchisee["_id"])
+        employee_ids = [emp["_id"] for emp in self.db_employees]
 
         start_datetime = datetime.combine(start_date, time.min)
         end_datetime = datetime.combine(end_date, time.max)
 
-        vacations_cursor = self.db.vacations.find({
+        self.db_vacations = await self.db.vacations.find({
             "user_id": {"$in": employee_ids},
             "status": models.VacationStatus.APPROVED.value,
             "start_date": {"$lte": end_datetime},
             "end_date": {"$gte": start_datetime}
-        })
-        async for vacation in vacations_cursor:
-            d = vacation["start_date"].date()
-            while d <= vacation["end_date"].date():
-                self.vacations[vacation["user_id"]].append(d)
-                d += timedelta(days=1)
+        }).to_list(length=None)
 
-        avail_cursor = self.db.availability.find({
+        self.db_availabilities = await self.db.availability.find({
             "user_id": {"$in": employee_ids},
             "date": {"$gte": start_datetime, "$lte": end_datetime}
-        })
-        async for av in avail_cursor:
-            d = av["date"].date()
-            self.availabilities[av["user_id"]][d] = av
+        }).to_list(length=None)
 
     def _parse_time(self, t_str: str) -> time:
-        if isinstance(t_str, time):
-            return t_str
-        try:
-            return datetime.strptime(t_str, "%H:%M").time()
+        if isinstance(t_str, time): return t_str
+        try: return datetime.strptime(t_str, "%H:%M").time()
         except ValueError:
-            try:
-                return datetime.strptime(t_str, "%H:%M:%S").time()
-            except ValueError:
-                return time(0, 0)
+            try: return datetime.strptime(t_str, "%H:%M:%S").time()
+            except ValueError: return time(0, 0)
 
     def _get_shift_datetime_range(self, date_obj: date, shift_name: str) -> Tuple[datetime, datetime]:
         start_str, end_str = resolve_shift_hours(date_obj, shift_name, self.store_settings, self.holidays_map)
-        
-        start_t = self._parse_time(start_str)
-        end_t = self._parse_time(end_str)
-        
-        start_dt = datetime.combine(date_obj, start_t)
-        end_dt = datetime.combine(date_obj, end_t)
-        # Fix nocnych zmian
+        start_dt = datetime.combine(date_obj, self._parse_time(start_str))
+        end_dt = datetime.combine(date_obj, self._parse_time(end_str))
         if end_dt <= start_dt: 
             end_dt += timedelta(days=1)
         return start_dt, end_dt
 
-    def _is_working_on_day(self, emp_id: ObjectId, date_obj: date) -> bool:
-        if date_obj not in self.schedule: return False
-        for shift_list in self.schedule[date_obj].values():
-            if emp_id in shift_list: return True
-        return False
+    def _map_to_domain(self, start_date: date, end_date: date):
+        vacations_by_user = defaultdict(list)
+        for v in self.db_vacations:
+            d = v["start_date"].date()
+            while d <= v["end_date"].date():
+                if start_date <= d <= end_date:
+                    dt_start = datetime.combine(d, time.min)
+                    dt_end = datetime.combine(d, time.max)
+                    vacations_by_user[v["user_id"]].append(TimeRange(dt_start, dt_end))
+                d += timedelta(days=1)
 
-    def _get_consecutive_work_days(self, emp_id: ObjectId, center_date: date) -> int:
-        consecutive = 1
-        d = center_date - timedelta(days=1)
-        while self._is_working_on_day(emp_id, d):
-            consecutive += 1
-            d -= timedelta(days=1)
-        d = center_date + timedelta(days=1)
-        while self._is_working_on_day(emp_id, d):
-            consecutive += 1
-            d += timedelta(days=1)
-        return consecutive
+        avail_by_user = defaultdict(dict)
+        for a in self.db_availabilities:
+            d = a["date"].date()
+            avail_by_user[a["user_id"]][d] = a
 
-    def _check_rest_period(self, emp_id: ObjectId, current_start: datetime, current_end: datetime) -> bool:
-        current_date = current_start.date()
-        
-        # Wczoraj
-        prev_date = current_date - timedelta(days=1)
-        if prev_date in self.schedule:
-            for s_name, employees in self.schedule[prev_date].items():
-                if emp_id in employees:
-                    _, s_end = self._get_shift_datetime_range(prev_date, s_name)
-                    if (current_start - s_end).total_seconds() / 3600.0 < 11: # ZMIANA: Zazwyczaj 11h
-                        return False
-
-        # Dzisiaj
-        if current_date in self.schedule:
-            for s_name, employees in self.schedule[current_date].items():
-                if emp_id in employees:
-                    return False 
-
-        # Jutro
-        next_date = current_date + timedelta(days=1)
-        if next_date in self.schedule:
-            for s_name, employees in self.schedule[next_date].items():
-                if emp_id in employees:
-                    s_start, _ = self._get_shift_datetime_range(next_date, s_name)
-                    if (s_start - current_end).total_seconds() / 3600.0 < 11: # ZMIANA: Zazwyczaj 11h
-                        return False
-                        
-        return True
-
-    def _check_weekly_rest(self, emp_id: ObjectId, date_obj: date, shift_name: str) -> bool:
-        start_of_week = date_obj - timedelta(days=date_obj.weekday())
-        end_of_week = start_of_week + timedelta(days=6)
-        
-        intervals = []
-        
-        curr = start_of_week
-        while curr <= end_of_week:
-            if curr in self.schedule:
-                for s_name, employees in self.schedule[curr].items():
-                    if emp_id in employees:
-                        s_start, s_end = self._get_shift_datetime_range(curr, s_name)
-                        intervals.append((s_start, s_end))
-            curr += timedelta(days=1)
-            
-        new_start, new_end = self._get_shift_datetime_range(date_obj, shift_name)
-        intervals.append((new_start, new_end))
-        
-        intervals.sort(key=lambda x: x[0])
-        
-        max_gap = 0.0
-        week_start_dt = datetime.combine(start_of_week, time.min)
-        week_end_dt = datetime.combine(end_of_week, time.max)
-        
-        if intervals:
-            gap = (intervals[0][0] - week_start_dt).total_seconds() / 3600.0
-            if gap > max_gap: max_gap = gap
-            
-            for i in range(len(intervals) - 1):
-                gap = (intervals[i+1][0] - intervals[i][1]).total_seconds() / 3600.0
-                if gap > max_gap: max_gap = gap
-                
-            gap = (week_end_dt - intervals[-1][1]).total_seconds() / 3600.0
-            if gap > max_gap: max_gap = gap
-        else:
-            return True
-            
-        return max_gap >= 35
-
-    def _check_hard_constraints(self, emp_id: ObjectId, date_obj: date, shift_name: str) -> bool:
-        if date_obj in self.vacations.get(emp_id, []):
-            return False
-
-        if self._get_consecutive_work_days(emp_id, date_obj) > 6: # Standard Kodeksu to 6 dni
-            return False
-
-        start_dt, end_dt = self._get_shift_datetime_range(date_obj, shift_name)
-        
-        # Jeśli zmiana zwraca ramy zamknięte lub błędne
-        if (end_dt - start_dt).total_seconds() <= 0:
-            return False
-
-        duration = (end_dt - start_dt).total_seconds() / 3600.0
-        if duration > 12: # Standardowo max 12 w handlu
-            return False
-
-        if not self._check_rest_period(emp_id, start_dt, end_dt):
-            return False
-            
-        if not self._check_weekly_rest(emp_id, date_obj, shift_name):
-            return False
-
-        has_availability = False
-        if emp_id in self.availabilities and date_obj in self.availabilities[emp_id]:
-            has_availability = True
-            av = self.availabilities[emp_id][date_obj]
-            p_type = av.get("period_type", "").lower()
-            
-            # KROK 1: Twarda Blokada (Dni Wolne / Dyspozycje "W")
-            if p_type in ["wolne", "urlop", "niedostępny", "unavailable", "day_off", "w", "off"]:
-                return False
-            
-            # Część KROKU 3: Blokada przypisania do innej zmiany, jeśli pracownik poprosił o konkretną
-            mapped_p_type = p_type
-            if p_type in ["rano", "morning"]: mapped_p_type = schemas.ShiftType.MORNING.value
-            elif p_type in ["środek", "middle"]: mapped_p_type = schemas.ShiftType.MIDDLE.value
-            elif p_type in ["wieczór", "zamknięcie", "closing"]: mapped_p_type = schemas.ShiftType.CLOSING.value
-            
-            if mapped_p_type in [schemas.ShiftType.MORNING.value, schemas.ShiftType.MIDDLE.value, schemas.ShiftType.CLOSING.value]:
-                if shift_name != mapped_p_type:
-                    return False
-            
-            if av.get("start_time") is not None and av.get("end_time") is not None:
-                av_start = self._parse_time(av["start_time"])
-                av_end = self._parse_time(av["end_time"])
-                
-                shift_start_t = start_dt.time()
-                shift_end_t = end_dt.time()
-                
-                if shift_start_t < av_start or shift_end_t > av_end:
-                    return False
-
-        # KROK 2: Blokada z Preferencji Dni (pn-pt / sb-nd) jeśli NIE MA dyspozycji
-        if not has_availability:
-            emp = self.employees_by_id.get(emp_id)
-            if emp:
-                prefs = emp.get("preferences", {}) or {}
-                day_pref = prefs.get("day_preference")
-                is_weekend = date_obj.weekday() >= 5
-                
-                if day_pref == schemas.DayPreference.WEEKDAYS.value and is_weekend:
-                    return False
-                if day_pref == schemas.DayPreference.WEEKENDS.value and not is_weekend:
-                    return False
-
-        return True
-
-    def _assign_employee(self, emp_id: ObjectId, date_obj: date, shift_name: str):
-        self.schedule[date_obj][shift_name].append(emp_id)
-        
-        start_dt, end_dt = self._get_shift_datetime_range(date_obj, shift_name)
-        duration = (end_dt - start_dt).total_seconds() / 3600.0
-        self.employee_state[emp_id]["hours"] += duration
-
-    def _calculate_score(self, emp_id: ObjectId, day: date, shift_name: str) -> float:
-        score = 0.0
-        emp = self.employees_by_id.get(emp_id)
-        if not emp: return 0
-        
-        has_specific_shift_request = False
-        
-        # KROK 3: Nadpisywanie Zmian (Dyspozycja > Preferencja)
-        if emp_id in self.availabilities and day in self.availabilities[emp_id]:
-            av = self.availabilities[emp_id][day]
-            p_type = av.get("period_type", "").lower()
-            
-            mapped_p_type = p_type
-            if p_type in ["rano", "morning"]: mapped_p_type = schemas.ShiftType.MORNING.value
-            elif p_type in ["środek", "middle"]: mapped_p_type = schemas.ShiftType.MIDDLE.value
-            elif p_type in ["wieczór", "zamknięcie", "closing"]: mapped_p_type = schemas.ShiftType.CLOSING.value
-            
-            if mapped_p_type in [schemas.ShiftType.MORNING.value, schemas.ShiftType.MIDDLE.value, schemas.ShiftType.CLOSING.value]:
-                has_specific_shift_request = True
-                if mapped_p_type == shift_name:
-                    score += 1000  # Maksymalny priorytet
-                    return score
-
-        prefs = emp.get("preferences", {}) or {}
-        
-        # Ignoruj preferred_shifts jeśli pracownik złożył dyspozycję na konkretną zmianę tego dnia
-        if not has_specific_shift_request:
-            if shift_name in prefs.get("preferred_shifts", []):
-                score += 10
-            
-        day_pref = prefs.get("day_preference")
-        is_weekend = day.weekday() >= 5
-        if day_pref == schemas.DayPreference.WEEKENDS.value and is_weekend:
-            score += 5
-        elif day_pref == schemas.DayPreference.WEEKDAYS.value and not is_weekend:
-            score += 5
-            
-        return score
-
-    async def generate(self, start_date: date, end_date: date):
-        await self._gather_data(start_date, end_date)
-        conflicts: List[str] = []
-        
-        # Przetasowanie bazy kandydatów na start, by zapewnić różnorodność ("solver" niedeterministyczny)
-        random.shuffle(self.employees)
-        
-        uop_employees = [e for e in self.employees if e.get("contract_type") == models.ContractType.UOP.value]
-        uz_employees = [e for e in self.employees if e.get("contract_type") == models.ContractType.UZ.value]
-        
-        targets = {}
-        for e in self.employees:
-            if e.get("contract_type") == models.ContractType.UOP.value:
-                targets[e["_id"]] = 160.0 * e.get("fte", 1.0)
+        for db_emp in self.db_employees:
+            contract = db_emp.get("contract_type", "UZL")
+            if contract == models.ContractType.UOP.value:
+                fte_or_target = float(db_emp.get("fte", 1.0))
             else:
-                targets[e["_id"]] = float(e.get("monthly_hours_target", 100))
+                fte_or_target = float(db_emp.get("monthly_hours_target", 100))
 
-        global_critical_shifts = []
-        global_standard_shifts = []
-        
+            emp = Employee(
+                id=str(db_emp["_id"]),
+                db_id=db_emp["_id"],
+                first_name=db_emp.get("first_name", ""),
+                last_name=db_emp.get("last_name", ""),
+                contract_type=contract,
+                fte_or_target=fte_or_target,
+                preferences=db_emp.get("preferences", {}) or {}
+            )
+
+            # 1. Unavailabilities z Urlopów
+            emp.unavailabilities.extend(vacations_by_user[db_emp["_id"]])
+            
+            # 2. Unavailabilities i Requesty z Dyspozycyjności
+            for d, a in avail_by_user[db_emp["_id"]].items():
+                p_type = a.get("period_type", "").lower()
+                # OFF
+                if p_type in ["wolne", "urlop", "niedostępny", "unavailable", "day_off", "w", "off"]:
+                    dt_start = datetime.combine(d, time.min)
+                    dt_end = datetime.combine(d, time.max)
+                    if a.get("start_time") and a.get("end_time"):
+                        dt_start = datetime.combine(d, self._parse_time(a["start_time"]))
+                        dt_end = datetime.combine(d, self._parse_time(a["end_time"]))
+                        if dt_end <= dt_start: dt_end += timedelta(days=1)
+                    emp.unavailabilities.append(TimeRange(dt_start, dt_end))
+                else:
+                    # Request (chce pracować)
+                    mapped = None
+                    if p_type in ["rano", "morning", schemas.ShiftType.MORNING.value]: mapped = schemas.ShiftType.MORNING.value
+                    elif p_type in ["środek", "middle", schemas.ShiftType.MIDDLE.value]: mapped = schemas.ShiftType.MIDDLE.value
+                    elif p_type in ["wieczór", "zamknięcie", "closing", schemas.ShiftType.CLOSING.value]: mapped = schemas.ShiftType.CLOSING.value
+                    if mapped:
+                        emp.requested_shifts[d] = mapped
+                        # Wąskie ramy dostępności jako Unavailability dla pozostałej części dnia
+                        if a.get("start_time") and a.get("end_time"):
+                            av_start = datetime.combine(d, self._parse_time(a["start_time"]))
+                            av_end = datetime.combine(d, self._parse_time(a["end_time"]))
+                            if av_end <= av_start: av_end += timedelta(days=1)
+                            
+                            # Czas PRZED dostępnością
+                            if av_start > datetime.combine(d, time.min):
+                                emp.unavailabilities.append(TimeRange(datetime.combine(d, time.min), av_start))
+                            # Czas PO dostępności
+                            if av_end < datetime.combine(d, time.max):
+                                emp.unavailabilities.append(TimeRange(av_end, datetime.combine(d, time.max)))
+
+            self.employees.append(emp)
+
+        # 3. Zapotrzebowanie pracodawcy (Shift Demand)
         curr = start_date
         while curr <= end_date:
             date_str = curr.strftime("%Y-%m-%d")
-            
             holiday_info = self.holidays_map.get(date_str, {})
             if holiday_info.get("is_closed"):
-                self.schedule[curr]["is_closed"] = True 
                 curr += timedelta(days=1)
                 continue
 
             is_promo_change_day = (curr - PROMO_REFERENCE_DATE).days % 14 == 0
             closing_needs = self.store_settings.get("employees_on_promo_change", 2) if is_promo_change_day else self.store_settings.get("employees_per_closing_shift", 1)
             
-            # HARD CONSTRAINT: Wymuszamy minimum 1 osobę na otwarciu i zamknięciu
+            # HARD CONSTRAINT na minimalną liczbę pracowników
             needs = {
                 schemas.ShiftType.MORNING.value: max(1, int(self.store_settings.get("employees_per_morning_shift", 1))),
                 schemas.ShiftType.MIDDLE.value: max(0, int(self.store_settings.get("employees_per_middle_shift", 0))),
                 schemas.ShiftType.CLOSING.value: max(1, int(closing_needs))
             }
-            
+
             for shift_name, count in needs.items():
-                for _ in range(count):
-                    shift_info = {"date": curr, "name": shift_name}
-                    if shift_name in [schemas.ShiftType.MORNING.value, schemas.ShiftType.CLOSING.value]:
-                        global_critical_shifts.append(shift_info)
-                    else:
-                        global_standard_shifts.append(shift_info)
+                if count > 0:
+                    st, et = self._get_shift_datetime_range(curr, shift_name)
+                    self.demands.append(ShiftDemand(
+                        id=f"{date_str}_{shift_name}",
+                        time_range=TimeRange(st, et),
+                        required_employees=count,
+                        shift_type=shift_name
+                    ))
+
             curr += timedelta(days=1)
 
-        # Mieszamy nieznacznie kolejność przydzielania zmian krytycznych tego samego dnia,
-        # co też doda więcej losowości na krawędzi dostępności pracowników
-        day_critical_shifts = defaultdict(list)
-        for shift in global_critical_shifts:
-            day_critical_shifts[shift["date"]].append(shift)
-            
-        global_critical_shifts_shuffled = []
-        for d in sorted(day_critical_shifts.keys()):
-            shifts_today = day_critical_shifts[d]
-            random.shuffle(shifts_today)
-            global_critical_shifts_shuffled.extend(shifts_today)
-
-        day_standard_shifts = defaultdict(list)
-        for shift in global_standard_shifts:
-            day_standard_shifts[shift["date"]].append(shift)
-            
-        global_standard_shifts_shuffled = []
-        for d in sorted(day_standard_shifts.keys()):
-            shifts_today = day_standard_shifts[d]
-            random.shuffle(shifts_today)
-            global_standard_shifts_shuffled.extend(shifts_today)
-
-        # Generowanie zmian krytycznych
-        for shift in global_critical_shifts_shuffled:
-            current_date = shift["date"]
-            shift_name = shift["name"]
-            day_str = current_date.isoformat()
-            
-            start_dt, end_dt = self._get_shift_datetime_range(current_date, shift_name)
-            if (end_dt - start_dt).total_seconds() <= 0:
-                continue
-
-            candidates = []
-            group1 = [e["_id"] for e in uop_employees if self.employee_state[e["_id"]]["hours"] < targets[e["_id"]]]
-            candidates.extend([(uid, 1) for uid in group1])
-            group2 = [e["_id"] for e in uz_employees if self.employee_state[e["_id"]]["hours"] < targets[e["_id"]] * 1.2]
-            candidates.extend([(uid, 2) for uid in group2])
-            candidates.append((self.franchisee["_id"], 3))
-            group4 = [e["_id"] for e in self.employees if e["_id"] not in group1 and e["_id"] not in group2]
-            candidates.extend([(uid, 4) for uid in group4])
-
-            valid_candidates = []
-            for uid, priority in candidates:
-                if self._is_working_on_day(uid, current_date): continue
-                if self._check_hard_constraints(uid, current_date, shift_name):
-                    score = self._calculate_score(uid, current_date, shift_name)
-                    # Wprowadzamy szum losowy, aby solver nie był deterministyczny
-                    score += random.uniform(-3.0, 3.0)
-                    valid_candidates.append((uid, priority, score))
-            
-            valid_candidates.sort(key=lambda x: (x[1], -x[2], random.random()))
-            
-            if valid_candidates:
-                selected_uid = valid_candidates[0][0]
-                self._assign_employee(selected_uid, current_date, shift_name)
-            else:
-                # FALLBACK: HARD CONSTRAINT - Nie wolno pominąć zmiany zamykającej/otwierającej. 
-                # Znajdź pracownika, który dziś nie pracuje i nie ma urlopu
-                emergency_candidates = []
-                for uid, priority in candidates:
-                    if not self._is_working_on_day(uid, current_date):
-                        if current_date not in self.vacations.get(uid, []):
-                            emergency_candidates.append(uid)
+    def _check_hard_constraints(self, emp: Employee, shift: ShiftDemand) -> bool:
+        for unav in emp.unavailabilities:
+            if unav.overlaps(shift.time_range):
+                return False
                 
-                if emergency_candidates:
-                    # Sortujemy po najmniejszej liczbie przepracowanych dotychczas godzin
-                    emergency_candidates.sort(key=lambda u: self.employee_state[u]["hours"])
-                    selected_uid = emergency_candidates[0]
-                    self._assign_employee(selected_uid, current_date, shift_name)
-                    conflicts.append(f"[KRYTYCZNE - WYMUSZONO] Dnia {day_str} awaryjnie przypisano pracownika na zmianę '{shift_name}', łamiąc miękkie reguły odpoczynku/preferencji, by zapewnić obsadę.")
-                else:
-                    conflicts.append(f"[KRYTYCZNE - FATAL] Dnia {day_str} CAŁKOWITY BRAK pracownika na zmianę '{shift_name}'. Wszyscy są przypisani lub mają urlop.")
+        for assigned in emp.assigned_shifts:
+            if assigned.time_range.overlaps(shift.time_range):
+                return False
+            # Max 1 shift per day logic (dodatkowe zabezpieczenie w polskim prawie)
+            if assigned.time_range.start.date() == shift.time_range.start.date():
+                return False
 
-        # Generowanie zmian standardowych
-        for shift in global_standard_shifts_shuffled:
-            current_date = shift["date"]
-            shift_name = shift["name"]
-            day_str = current_date.isoformat()
-            
-            start_dt, end_dt = self._get_shift_datetime_range(current_date, shift_name)
-            if (end_dt - start_dt).total_seconds() <= 0:
-                continue
+        for assigned in emp.assigned_shifts:
+            if assigned.time_range.end <= shift.time_range.start:
+                gap = (shift.time_range.start - assigned.time_range.end).total_seconds() / 3600.0
+                if gap < 11: return False
+            elif shift.time_range.end <= assigned.time_range.start:
+                gap = (assigned.time_range.start - shift.time_range.end).total_seconds() / 3600.0
+                if gap < 11: return False
 
-            candidates = []
-            group1 = [e["_id"] for e in uop_employees if self.employee_state[e["_id"]]["hours"] < targets[e["_id"]]]
-            candidates.extend([(uid, 1) for uid in group1])
-            group2 = [e["_id"] for e in uz_employees if self.employee_state[e["_id"]]["hours"] < targets[e["_id"]] * 1.2]
-            candidates.extend([(uid, 2) for uid in group2])
-            candidates.append((self.franchisee["_id"], 3))
-            group4 = [e["_id"] for e in self.employees if e["_id"] not in group1 and e["_id"] not in group2]
-            candidates.extend([(uid, 4) for uid in group4])
-
-            valid_candidates = []
-            for uid, priority in candidates:
-                if self._is_working_on_day(uid, current_date): continue
-                if self._check_hard_constraints(uid, current_date, shift_name):
-                    score = self._calculate_score(uid, current_date, shift_name)
-                    score += random.uniform(-3.0, 3.0)
-                    valid_candidates.append((uid, priority, score))
-            
-            valid_candidates.sort(key=lambda x: (x[1], -x[2], random.random()))
-            
-            if valid_candidates:
-                selected_uid = valid_candidates[0][0]
-                self._assign_employee(selected_uid, current_date, shift_name)
-            else:
-                # W zmianach standardowych też używamy fallbacku
-                emergency_candidates = []
-                for uid, priority in candidates:
-                    if not self._is_working_on_day(uid, current_date):
-                        if current_date not in self.vacations.get(uid, []):
-                            emergency_candidates.append(uid)
+        if emp.contract_type == 'UOP':
+            if round(emp.worked_hours + shift.time_range.hours, 2) > round(emp.target_hours, 2):
+                return False
                 
-                if emergency_candidates:
-                    emergency_candidates.sort(key=lambda u: self.employee_state[u]["hours"])
-                    selected_uid = emergency_candidates[0]
-                    self._assign_employee(selected_uid, current_date, shift_name)
-                    conflicts.append(f"[WYMUSZONO] Dnia {day_str} awaryjnie przypisano pracownika na zmianę '{shift_name}'.")
-                else:
-                    conflicts.append(f"Dnia {day_str} brakuje pracownika na zmianie '{shift_name}'.")
+        # Sprawdzanie preferencji dni (tylko jesli nie ma prośby wpisanej w dyspozycję)
+        if shift.time_range.start.date() not in emp.requested_shifts:
+            day_pref = emp.preferences.get("day_preference")
+            is_weekend = shift.time_range.start.weekday() >= 5
+            if day_pref == schemas.DayPreference.WEEKDAYS.value and is_weekend:
+                return False
+            if day_pref == schemas.DayPreference.WEEKENDS.value and not is_weekend:
+                return False
 
-        # BUDOWA KOŃCOWEGO JSONA
+        return True
+
+    def _assign(self, emp: Employee, shift: ShiftDemand):
+        emp.assigned_shifts.append(shift)
+        emp.worked_hours += shift.time_range.hours
+        shift.required_employees -= 1
+
+    def _get_weighted_random_employee(self, candidates: List[Employee]) -> Optional[Employee]:
+        if not candidates:
+            return None
+        weights = [max(0.1, e.remaining_hours) for e in candidates]
+        return random.choices(candidates, weights=weights, k=1)[0]
+
+    def _calculate_soft_score(self, emp: Employee, shift: ShiftDemand) -> float:
+        score = 0.0
+        shift_date = shift.time_range.start.date()
+        
+        if emp.requested_shifts.get(shift_date) == shift.shift_type:
+            score += 100.0
+            
+        prefs = emp.preferences.get("preferred_shifts", [])
+        if shift.shift_type in prefs:
+            score += 10.0
+            
+        return score
+
+    async def generate(self, start_date: date, end_date: date):
+        await self._gather_data(start_date, end_date)
+        self._map_to_domain(start_date, end_date)
+        
+        uop_emps = [e for e in self.employees if e.contract_type == 'UOP']
+        uzl_emps = [e for e in self.employees if e.contract_type == 'UZL']
+
+        # Wyliczenie Puli (Art. 130)
+        full_uop_hours = calculate_uop_hours(start_date.year, start_date.month, 1.0)
+        for emp in uop_emps:
+            emp.target_hours = full_uop_hours * emp.fte_or_target
+        for emp in uzl_emps:
+            emp.target_hours = emp.fte_or_target
+
+        # Przygotowanie slotów (klonowanie dla każdego wymaganego pracownika)
+        slots = []
+        for demand in self.demands:
+            for _ in range(demand.required_employees):
+                slots.append(ShiftDemand(
+                    id=demand.id,
+                    time_range=demand.time_range,
+                    required_employees=1,
+                    shift_type=demand.shift_type
+                ))
+            
+        # Zapewnienie losowości i uniknięcie faworyzacji poniedziałków/początków miesiąca
+        random.shuffle(slots)
+        # USUNIĘTO SORTOWANIE (slots.sort) ABY ALGORYTM SKAKAŁ LOSOWO PO CAŁYM MIESIĄCU
+
+        # KROK 2: Pre-assign (Requested Shifts)
+        for shift in slots:
+            if shift.required_employees <= 0: continue
+            
+            shift_date = shift.time_range.start.date()
+            candidates = [
+                e for e in self.employees 
+                if e.requested_shifts.get(shift_date) == shift.shift_type 
+                and self._check_hard_constraints(e, shift)
+            ]
+            if candidates:
+                chosen = self._get_weighted_random_employee(candidates)
+                if chosen: self._assign(chosen, shift)
+
+        # KROK 3: Faza UOP
+        for shift in slots:
+            if shift.required_employees <= 0: continue
+            
+            candidates = [e for e in uop_emps if self._check_hard_constraints(e, shift)]
+            if candidates:
+                candidates.sort(key=lambda e: self._calculate_soft_score(e, shift), reverse=True)
+                top_score = self._calculate_soft_score(candidates[0], shift)
+                top_candidates = [e for e in candidates if self._calculate_soft_score(e, shift) == top_score]
+                chosen = self._get_weighted_random_employee(top_candidates)
+                if chosen: self._assign(chosen, shift)
+
+        # KROK 4: Faza UZL
+        for shift in slots:
+            if shift.required_employees <= 0: continue
+            
+            candidates = []
+            for e in uzl_emps:
+                if self._check_hard_constraints(e, shift):
+                    if e.worked_hours + shift.time_range.hours <= e.target_hours * 1.2:
+                        candidates.append(e)
+            
+            if candidates:
+                candidates.sort(key=lambda e: self._calculate_soft_score(e, shift), reverse=True)
+                top_score = self._calculate_soft_score(candidates[0], shift)
+                top_candidates = [e for e in candidates if self._calculate_soft_score(e, shift) == top_score]
+                chosen = self._get_weighted_random_employee(top_candidates)
+                if chosen: self._assign(chosen, shift)
+
+        # KROK 5: Fallback & Alerty
+        for shift in slots:
+            if shift.required_employees > 0:
+                fallback_candidates = []
+                for e in self.employees:
+                    # Zmodyfikowane Hard Constraints (omijamy preferencje dni, limity godzin, 
+                    # ale ZACHOWUJEMY minimum 11h, 1 zmianę/dzień i brak nachodzenia na urlop/inną zmianę)
+                    can_work = True
+                    for unav in e.unavailabilities:
+                        if unav.overlaps(shift.time_range): can_work = False
+                    for assigned in e.assigned_shifts:
+                        if assigned.time_range.overlaps(shift.time_range): can_work = False
+                        if assigned.time_range.start.date() == shift.time_range.start.date(): can_work = False
+                        if assigned.time_range.end <= shift.time_range.start:
+                            if (shift.time_range.start - assigned.time_range.end).total_seconds() / 3600.0 < 11: can_work = False
+                        elif shift.time_range.end <= assigned.time_range.start:
+                            if (assigned.time_range.start - shift.time_range.end).total_seconds() / 3600.0 < 11: can_work = False
+                            
+                    if can_work:
+                        fallback_candidates.append(e)
+                
+                if fallback_candidates:
+                    fallback_candidates.sort(key=lambda e: e.worked_hours)
+                    chosen = fallback_candidates[0]
+                    self._assign(chosen, shift)
+                    self.logs.append(f"[KRYTYCZNE - WYMUSZONO] Awaryjnie przypisano pracownika {chosen.first_name} {chosen.last_name} do zmiany '{shift.shift_type}' ({shift.time_range.start.date()}), ignorując docelowe czasy pracy.")
+                else:
+                    date_str = shift.time_range.start.strftime("%Y-%m-%d")
+                    self.logs.append(f"[KRYTYCZNE - FATAL] Nie można obsadzić zmiany '{shift.shift_type}' w dniu {date_str} – brak dostępnego personelu (wszyscy zablokowani twardymi ograniczeniami).")
+
+        # Mapowanie z powrotem do docelowego formatu JSON
         final_schedule_for_json = {}
         curr = start_date
         while curr <= end_date:
             date_str = curr.isoformat()
             final_schedule_for_json[date_str] = {}
             
-            if getattr(self.schedule.get(curr, {}), "get", lambda k,d: d)("is_closed", False):
+            holiday_info = self.holidays_map.get(date_str, {})
+            if holiday_info.get("is_closed"):
                 final_schedule_for_json[date_str] = {"is_closed": True}
-                
-                # ZADANIE: Logowanie dni zamkniętych
-                if curr.weekday() == 6 or date_str in self.holidays_map:
-                     logger.info(f"✅ DEBUG GENERATORA - Zapisano zamknięty dzień ({date_str}): {final_schedule_for_json[date_str]}")
-                
                 curr += timedelta(days=1)
                 continue
+            
+            for shift_type in [schemas.ShiftType.MORNING.value, schemas.ShiftType.MIDDLE.value, schemas.ShiftType.CLOSING.value]:
+                emp_list = []
+                for emp in self.employees:
+                    for assigned in emp.assigned_shifts:
+                        if assigned.time_range.start.date() == curr and assigned.shift_type == shift_type:
+                            emp_list.append({
+                                "id": emp.id,
+                                "first_name": emp.first_name,
+                                "last_name": emp.last_name
+                            })
                 
-            shifts = self.schedule.get(curr, {})
-            for shift_name, emp_ids in shifts.items():
-                if not emp_ids or shift_name == "is_closed": continue
-                
-                # Używamy uniwersalnego resolwera z schedule_service
-                start_str, end_str = resolve_shift_hours(curr, shift_name, self.store_settings, self.holidays_map)
-                
-                employees_data = []
-                for eid in emp_ids:
-                    emp_data = self.employee_map.get(str(eid))
-                    if emp_data: employees_data.append(emp_data)
-                    else: employees_data.append({"id": str(eid), "first_name": "Unknown", "last_name": "User"})
-                    
-                final_schedule_for_json[date_str][shift_name] = {
-                    "start_time": start_str,
-                    "end_time": end_str,
-                    "employees": employees_data
-                }
-                
-            # ZADANIE: Logowanie gotowego obiektu dla dni specjalnych przed zapisem
-            if curr.weekday() == 6 or date_str in self.holidays_map:
-                logger.info(f"✅ DEBUG GENERATORA - Zmiany w dzień specjalny ({date_str}): {final_schedule_for_json[date_str]}")
+                if emp_list:
+                    start_str, end_str = resolve_shift_hours(curr, shift_type, self.store_settings, self.holidays_map)
+                    final_schedule_for_json[date_str][shift_type] = {
+                        "start_time": start_str,
+                        "end_time": end_str,
+                        "employees": emp_list
+                    }
 
             vacation_employees = []
-            all_ids = set(self.employees_by_id.keys())
-            for uid in all_ids:
-                if curr in self.vacations.get(uid, []):
-                    emp_data = self.employee_map.get(str(uid))
-                    if emp_data: vacation_employees.append(emp_data)
+            for v in self.db_vacations:
+                if v["start_date"].date() <= curr <= v["end_date"].date():
+                    uid = str(v["user_id"])
+                    emp_data = next((e for e in self.db_employees if str(e["_id"]) == uid), None)
+                    if emp_data:
+                        vacation_employees.append({
+                            "id": uid,
+                            "first_name": emp_data.get("first_name", ""),
+                            "last_name": emp_data.get("last_name", "")
+                        })
+            
             if vacation_employees:
                 final_schedule_for_json[date_str]["vacations"] = {
                     "employees": vacation_employees,
                     "is_vacation": True
                 }
+
             curr += timedelta(days=1)
 
         draft_document = {
@@ -546,12 +469,12 @@ class ScheduleGenerator:
             "start_date": datetime.combine(start_date, time.min),
             "end_date": datetime.combine(end_date, time.min),
             "schedule": final_schedule_for_json,
-            "conflicts": conflicts,
+            "conflicts": self.logs,
             "status": "DRAFT",
             "created_at": datetime.utcnow()
         }
         result = await self.db.schedule_drafts.insert_one(draft_document)
-        logger.info(f"Zapisano nowy grafik roboczy dla {self.franchise_code} z ID: {result.inserted_id}")
+        logger.info(f"Zapisano nowy grafik roboczy z architekturą Dataclass dla {self.franchise_code} z ID: {result.inserted_id}")
 
 async def generate_schedule_for_period(db: motor.motor_asyncio.AsyncIOMotorDatabase, current_user: dict, year: int, month: int):
     franchise_code = current_user.get("franchise_code")

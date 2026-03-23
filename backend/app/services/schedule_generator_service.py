@@ -335,9 +335,17 @@ class ScheduleGenerator:
                     shift_type=demand.shift_type
                 ))
             
-        # Zapewnienie losowości i uniknięcie faworyzacji poniedziałków/początków miesiąca
-        random.shuffle(slots)
-        # USUNIĘTO SORTOWANIE (slots.sort) ABY ALGORYTM SKAKAŁ LOSOWO PO CAŁYM MIESIĄCU
+        # Podział na zmiany krytyczne i poboczne
+        critical_types = [schemas.ShiftType.MORNING.value, schemas.ShiftType.CLOSING.value]
+        critical_slots = [s for s in slots if s.shift_type in critical_types]
+        non_critical_slots = [s for s in slots if s.shift_type not in critical_types]
+
+        # Tasowanie wewnątrz grup (żeby równomiernie rozłożyć godziny w miesiącu)
+        random.shuffle(critical_slots)
+        random.shuffle(non_critical_slots)
+
+        # Priorytetyzacja: najpierw zrób wszystkie ranki i zamknięcia, potem resztę
+        slots = critical_slots + non_critical_slots
 
         # KROK 2: Pre-assign (Requested Shifts)
         for shift in slots:

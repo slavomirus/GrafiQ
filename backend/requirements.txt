@@ -5,6 +5,7 @@ pydantic==2.10.1
 PyJWT==2.8.0
 certifi==2025.10.5
 unidecode==1.4.0
+holidays>=0.40
 
 # Authentication
 passlib[bcrypt]==1.7.4

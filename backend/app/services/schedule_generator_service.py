@@ -170,7 +170,7 @@ class ScheduleGenerator:
             if contract == models.ContractType.UOP.value:
                 fte_or_target = float(db_emp.get("fte", 1.0))
             else:
-                fte_or_target = float(db_emp.get("monthly_hours_target", 100))
+                fte_or_target = float(db_emp.get("monthly_hours_target", 120))
 
             emp = Employee(
                 id=str(db_emp["_id"]),
@@ -279,10 +279,10 @@ class ScheduleGenerator:
         if shift.time_range.start.date() not in emp.requested_shifts:
             day_pref = emp.preferences.get("day_preference")
             is_weekend = shift.time_range.start.weekday() >= 5
-            if day_pref == schemas.DayPreference.WEEKDAYS.value and is_weekend:
-                return False
-            if day_pref == schemas.DayPreference.WEEKENDS.value and not is_weekend:
-                return False
+            # if day_pref == schemas.DayPreference.WEEKDAYS.value and is_weekend:
+            #     return False
+            # if day_pref == schemas.DayPreference.WEEKENDS.value and not is_weekend:
+            #     return False
 
         return True
 

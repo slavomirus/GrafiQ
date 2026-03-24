@@ -203,20 +203,20 @@ class ScheduleGenerator:
                     if p_type in ["rano", "morning", schemas.ShiftType.MORNING.value]: mapped = schemas.ShiftType.MORNING.value
                     elif p_type in ["środek", "middle", schemas.ShiftType.MIDDLE.value]: mapped = schemas.ShiftType.MIDDLE.value
                     elif p_type in ["wieczór", "zamknięcie", "closing", schemas.ShiftType.CLOSING.value]: mapped = schemas.ShiftType.CLOSING.value
-                    if mapped:
-                        emp.requested_shifts[d] = mapped
-                        # Wąskie ramy dostępności jako Unavailability dla pozostałej części dnia
-                        if a.get("start_time") and a.get("end_time"):
-                            av_start = datetime.combine(d, self._parse_time(a["start_time"]))
-                            av_end = datetime.combine(d, self._parse_time(a["end_time"]))
-                            if av_end <= av_start: av_end += timedelta(days=1)
-                            
-                            # Czas PRZED dostępnością
-                            if av_start > datetime.combine(d, time.min):
-                                emp.unavailabilities.append(TimeRange(datetime.combine(d, time.min), av_start))
-                            # Czas PO dostępności
-                            if av_end < datetime.combine(d, time.max):
-                                emp.unavailabilities.append(TimeRange(av_end, datetime.combine(d, time.max)))
+                    # if mapped:
+                    #     emp.requested_shifts[d] = mapped
+                    #     # Wąskie ramy dostępności jako Unavailability dla pozostałej części dnia
+                    #     if a.get("start_time") and a.get("end_time"):
+                    #         av_start = datetime.combine(d, self._parse_time(a["start_time"]))
+                    #         av_end = datetime.combine(d, self._parse_time(a["end_time"]))
+                    #         if av_end <= av_start: av_end += timedelta(days=1)
+                    #
+                    #         # Czas PRZED dostępnością
+                    #         if av_start > datetime.combine(d, time.min):
+                    #             emp.unavailabilities.append(TimeRange(datetime.combine(d, time.min), av_start))
+                    #         # Czas PO dostępności
+                    #         if av_end < datetime.combine(d, time.max):
+                    #             emp.unavailabilities.append(TimeRange(av_end, datetime.combine(d, time.max)))
 
             self.employees.append(emp)
 

@@ -275,27 +275,12 @@ class ScheduleGenerator:
             if round(emp.worked_hours + shift.time_range.hours, 2) > round(emp.target_hours, 2):
                 return False
                 
-        # Sprawdzanie preferencji dni (tylko jesli nie ma prośby wpisanej w dyspozycję)
-        if shift.time_range.start.date() not in emp.requested_shifts:
-            day_pref = emp.preferences.get("day_preference")
-            is_weekend = shift.time_range.start.weekday() >= 5
-            # if day_pref == schemas.DayPreference.WEEKDAYS.value and is_weekend:
-            #     return False
-            # if day_pref == schemas.DayPreference.WEEKENDS.value and not is_weekend:
-            #     return False
-
         return True
 
     def _assign(self, emp: Employee, shift: ShiftDemand):
         emp.assigned_shifts.append(shift)
         emp.worked_hours += shift.time_range.hours
         shift.required_employees -= 1
-
-    def _get_weighted_random_employee(self, candidates: List[Employee]) -> Optional[Employee]:
-        if not candidates:
-            return None
-        weights = [max(0.1, e.remaining_hours) for e in candidates]
-        return random.choices(candidates, weights=weights, k=1)[0]
 
     def _calculate_soft_score(self, emp: Employee, shift: ShiftDemand) -> float:
         score = 0.0
@@ -307,6 +292,13 @@ class ScheduleGenerator:
         prefs = emp.preferences.get("preferred_shifts", [])
         if shift.shift_type in prefs:
             score += 10.0
+            
+        day_pref = emp.preferences.get("day_preference")
+        is_weekend = shift.time_range.start.weekday() >= 5
+        if day_pref == schemas.DayPreference.WEEKDAYS.value and not is_weekend:
+            score += 5.0
+        if day_pref == schemas.DayPreference.WEEKENDS.value and is_weekend:
+            score += 5.0
             
         return score
 
@@ -337,12 +329,8 @@ class ScheduleGenerator:
             
         # Podział na zmiany krytyczne i poboczne
         critical_types = [schemas.ShiftType.MORNING.value, schemas.ShiftType.CLOSING.value]
-        critical_slots = [s for s in slots if s.shift_type in critical_types]
-        non_critical_slots = [s for s in slots if s.shift_type not in critical_types]
-
-        # Tasowanie wewnątrz grup (żeby równomiernie rozłożyć godziny w miesiącu)
-        random.shuffle(critical_slots)
-        random.shuffle(non_critical_slots)
+        critical_slots = sorted([s for s in slots if s.shift_type in critical_types], key=lambda x: x.time_range.start)
+        non_critical_slots = sorted([s for s in slots if s.shift_type not in critical_types], key=lambda x: x.time_range.start)
 
         # Priorytetyzacja: najpierw zrób wszystkie ranki i zamknięcia, potem resztę
         slots = critical_slots + non_critical_slots
@@ -358,36 +346,53 @@ class ScheduleGenerator:
                 and self._check_hard_constraints(e, shift)
             ]
             if candidates:
-                chosen = self._get_weighted_random_employee(candidates)
-                if chosen: self._assign(chosen, shift)
+                # Oblicz burn_rate i weź tego o najniższym
+                valid_candidates = []
+                for e in candidates:
+                    if e.contract_type == 'UOP' and e.worked_hours + shift.time_range.hours > e.target_hours:
+                        continue
+                    if e.contract_type == 'UZL' and e.worked_hours + shift.time_range.hours > e.target_hours * 1.2:
+                        continue
+                    burn_rate = e.worked_hours / e.target_hours if e.target_hours > 0 else 1.0
+                    valid_candidates.append((e, burn_rate))
+                
+                if valid_candidates:
+                    valid_candidates.sort(key=lambda x: x[1])
+                    chosen = valid_candidates[0][0]
+                    self._assign(chosen, shift)
 
-        # KROK 3: Faza UOP
-        for shift in slots:
-            if shift.required_employees <= 0: continue
-            
-            candidates = [e for e in uop_emps if self._check_hard_constraints(e, shift)]
-            if candidates:
-                candidates.sort(key=lambda e: self._calculate_soft_score(e, shift), reverse=True)
-                top_score = self._calculate_soft_score(candidates[0], shift)
-                top_candidates = [e for e in candidates if self._calculate_soft_score(e, shift) == top_score]
-                chosen = self._get_weighted_random_employee(top_candidates)
-                if chosen: self._assign(chosen, shift)
-
-        # KROK 4: Faza UZL
+        # KROK 3: Główny Przydział Zmian
         for shift in slots:
             if shift.required_employees <= 0: continue
             
             candidates = []
-            for e in uzl_emps:
+            for e in self.employees:
                 if self._check_hard_constraints(e, shift):
-                    if e.worked_hours + shift.time_range.hours <= e.target_hours * 1.2:
-                        candidates.append(e)
+                    if e.contract_type == 'UOP' and e.worked_hours + shift.time_range.hours > e.target_hours:
+                        continue
+                    if e.contract_type == 'UZL' and e.worked_hours + shift.time_range.hours > e.target_hours * 1.2:
+                        continue
+                    candidates.append(e)
             
             if candidates:
-                candidates.sort(key=lambda e: self._calculate_soft_score(e, shift), reverse=True)
-                top_score = self._calculate_soft_score(candidates[0], shift)
-                top_candidates = [e for e in candidates if self._calculate_soft_score(e, shift) == top_score]
-                chosen = self._get_weighted_random_employee(top_candidates)
+                # Przypisz punktację do kandydatów
+                scored_candidates = []
+                for e in candidates:
+                    burn_rate = e.worked_hours / e.target_hours if e.target_hours > 0 else 1.0
+                    score = self._calculate_soft_score(e, shift)
+                    scored_candidates.append((e, score, burn_rate))
+                
+                # Wybierz grupę o najwyższym soft_score
+                scored_candidates.sort(key=lambda x: x[1], reverse=True)
+                top_score = scored_candidates[0][1]
+                top_candidates = [item for item in scored_candidates if item[1] == top_score]
+                
+                # Z grupy o najwyższym soft_score wybierz tego z najmniejszym burn_rate (w przypadku remisu losuj)
+                top_candidates.sort(key=lambda x: x[2])
+                min_burn_rate = top_candidates[0][2]
+                best_candidates = [item for item in top_candidates if item[2] == min_burn_rate]
+                
+                chosen = random.choice(best_candidates)[0]
                 if chosen: self._assign(chosen, shift)
 
         # KROK 5: Fallback & Alerty

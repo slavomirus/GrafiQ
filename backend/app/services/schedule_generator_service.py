@@ -177,6 +177,9 @@ class ScheduleGenerator:
             else:
                 fte_or_target = float(db_emp.get("monthly_hours_target", 120))
 
+            raw_prefs = db_emp.get("preferences", {}) or {}
+            normalized_prefs = self._normalize_preferences(raw_prefs)
+
             emp = Employee(
                 id=str(db_emp["_id"]),
                 db_id=db_emp["_id"],
@@ -184,7 +187,7 @@ class ScheduleGenerator:
                 last_name=db_emp.get("last_name", ""),
                 contract_type=contract,
                 fte_or_target=fte_or_target,
-                preferences=db_emp.get("preferences", {}) or {}
+                preferences=normalized_prefs
             )
 
             # 1. Unavailabilities z Urlopów
@@ -256,6 +259,54 @@ class ScheduleGenerator:
 
             curr += timedelta(days=1)
 
+    def _normalize_shift_name(self, name: str) -> Optional[str]:
+        """Normalizuje nazwę zmiany z różnych formatów do wartości enum ShiftType."""
+        if not name or not isinstance(name, str):
+            return None
+        n = name.lower().strip()
+        if n in ["morning", "rano", "poranna", "ranki", "zmiana poranna"]:
+            return schemas.ShiftType.MORNING.value
+        if n in ["middle", "środek", "pośrednia", "zmiana środkowa"]:
+            return schemas.ShiftType.MIDDLE.value
+        if n in ["closing", "wieczór", "zamykająca", "zamknięcia", "zamknięcie", "zetki", "zmiana zamykająca"]:
+            return schemas.ShiftType.CLOSING.value
+        # Spróbuj dopasować bezpośrednio do wartości enuma
+        for st in schemas.ShiftType:
+            if st.value == n:
+                return st.value
+        return None
+
+    def _normalize_preferences(self, raw_prefs: dict) -> dict:
+        """Normalizuje surowe preferencje z bazy danych do spójnego formatu."""
+        normalized = dict(raw_prefs)
+
+        # Normalizacja preferred_shifts
+        raw_shifts = raw_prefs.get("preferred_shifts", [])
+        if isinstance(raw_shifts, list):
+            norm_shifts = []
+            for s in raw_shifts:
+                mapped = self._normalize_shift_name(s)
+                if mapped and mapped not in norm_shifts:
+                    norm_shifts.append(mapped)
+            normalized["preferred_shifts"] = norm_shifts
+        else:
+            normalized["preferred_shifts"] = []
+
+        # Normalizacja day_preference
+        raw_day = raw_prefs.get("day_preference") or raw_prefs.get("preferred_days")
+        if isinstance(raw_day, list):
+            raw_day = raw_day[0] if raw_day else None
+        if raw_day and isinstance(raw_day, str):
+            d = raw_day.lower().strip()
+            if d in ["pn-pt", "weekdays", "dni robocze"]:
+                normalized["day_preference"] = schemas.DayPreference.WEEKDAYS.value
+            elif d in ["sb-nd", "weekends", "weekendy"]:
+                normalized["day_preference"] = schemas.DayPreference.WEEKENDS.value
+            elif d in ["cały tydzień", "whole week", "wszystkie dni"]:
+                normalized["day_preference"] = schemas.DayPreference.WHOLE_WEEK.value
+
+        return normalized
+
     def _check_hard_constraints(self, emp: Employee, shift: ShiftDemand) -> bool:
         for unav in emp.unavailabilities:
             if unav.overlaps(shift.time_range):
@@ -296,20 +347,32 @@ class ScheduleGenerator:
         score = 0.0
         shift_date = shift.time_range.start.date()
         
+        # 1. Requested shift na konkretny dzień (najwyższy priorytet)
         if emp.requested_shifts.get(shift_date) == shift.shift_type:
-            score += 100.0
-            
+            score += 200.0
+
+        # 2. Preferencje typu zmiany (KLUCZOWE)
         prefs = emp.preferences.get("preferred_shifts", [])
-        if shift.shift_type in prefs:
-            score += 10.0
-            
+        if prefs:  # Pracownik ma ustawione preferencje
+            if shift.shift_type in prefs:
+                score += 50.0   # BONUS za preferowaną zmianę
+            else:
+                score -= 30.0   # KARA za nie-preferowaną zmianę
+
+        # 3. Preferencje dni tygodnia
         day_pref = emp.preferences.get("day_preference")
         is_weekend = shift.time_range.start.weekday() >= 5
-        if day_pref == schemas.DayPreference.WEEKDAYS.value and not is_weekend:
-            score += 5.0
-        if day_pref == schemas.DayPreference.WEEKENDS.value and is_weekend:
-            score += 5.0
-            
+        if day_pref == schemas.DayPreference.WEEKDAYS.value:
+            if not is_weekend:
+                score += 10.0
+            else:
+                score -= 5.0
+        elif day_pref == schemas.DayPreference.WEEKENDS.value:
+            if is_weekend:
+                score += 10.0
+            else:
+                score -= 5.0
+
         return score
 
     async def generate(self, start_date: date, end_date: date):

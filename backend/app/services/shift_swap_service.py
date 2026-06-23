@@ -25,9 +25,13 @@ async def create_swap_request(
         raise HTTPException(status_code=400, detail="Nie możesz wymienić się sam ze sobą.")
 
     # 1. Weryfikacja zmian w grafiku
+    # Zapewniamy spójny typ ObjectId dla user_id
+    requester_oid = ObjectId(requester_id) if not isinstance(requester_id, ObjectId) else requester_id
+    target_oid = ObjectId(target_user_id) if not isinstance(target_user_id, ObjectId) else target_user_id
+
     requester_shift = await db.schedule.find_one({
         "franchise_code": franchise_code,
-        "user_id": requester_id,
+        "user_id": requester_oid,
         "date": datetime.combine(request.my_date, time.min),
         "shift_name": request.my_shift_name
     })
@@ -36,7 +40,7 @@ async def create_swap_request(
 
     target_shift = await db.schedule.find_one({
         "franchise_code": franchise_code,
-        "user_id": target_user_id,
+        "user_id": target_oid,
         "date": datetime.combine(request.target_date, time.min),
         "shift_name": request.target_shift_name
     })
@@ -45,8 +49,8 @@ async def create_swap_request(
 
     # 2. Walidacja reguł (Hard Constraints)
     validator = ScheduleValidator(db)
-    swap_data = request.dict()
-    swap_data["requester_id"] = requester_id
+    swap_data = request.model_dump()
+    swap_data["requester_id"] = requester_oid
     swap_data["franchise_code"] = franchise_code
     
     is_valid, reason = await validator.validate_swap(swap_data)
@@ -166,11 +170,11 @@ async def respond_to_swap(
 
 async def execute_swap(db: motor.motor_asyncio.AsyncIOMotorDatabase, swap: dict):
     """
-    Wykonuje fizyczną zamianę w grafiku.
+    Wykonuje fizyczną zamianę w grafiku (flat 'schedule' + nested 'schedules').
     """
     franchise_code = swap["franchise_code"]
-    requester_id = swap["requester_id"]
-    target_user_id = swap["target_user_id"]
+    requester_id = ObjectId(swap["requester_id"]) if not isinstance(swap["requester_id"], ObjectId) else swap["requester_id"]
+    target_user_id = ObjectId(swap["target_user_id"]) if not isinstance(swap["target_user_id"], ObjectId) else swap["target_user_id"]
     
     # Dane zmian
     date1 = swap["my_date"] # datetime
@@ -181,53 +185,59 @@ async def execute_swap(db: motor.motor_asyncio.AsyncIOMotorDatabase, swap: dict)
 
     # --- 1. Aktualizacja kolekcji płaskiej 'schedule' ---
     
-    # Znajdź dokumenty
     doc1 = await db.schedule.find_one({"franchise_code": franchise_code, "user_id": requester_id, "date": date1, "shift_name": shift1})
     doc2 = await db.schedule.find_one({"franchise_code": franchise_code, "user_id": target_user_id, "date": date2, "shift_name": shift2})
     
     if not doc1 or not doc2:
-        logger.error(f"Critical: Swap {swap['_id']} failed execution because shifts are missing.")
-        return
+        missing = []
+        if not doc1: missing.append(f"zmiana requestera ({shift1} w {date1})")
+        if not doc2: missing.append(f"zmiana targeta ({shift2} w {date2})")
+        logger.error(f"Swap {swap['_id']} failed: brak dokumentów: {', '.join(missing)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Błąd wykonania wymiany: nie znaleziono zmian w grafiku ({', '.join(missing)}). Skontaktuj się z administratorem."
+        )
 
-    # Zamień user_id
+    # Zamień user_id w flat schedule
     await db.schedule.update_one({"_id": doc1["_id"]}, {"$set": {"user_id": target_user_id}})
     await db.schedule.update_one({"_id": doc2["_id"]}, {"$set": {"user_id": requester_id}})
 
-    # --- 2. Aktualizacja kolekcji widoku 'schedules' ---
+    # --- 2. Aktualizacja kolekcji widoku 'schedules' (nested) ---
     
-    # Pobierz dane userów (imiona)
     user1 = await db.users.find_one({"_id": requester_id})
     user2 = await db.users.find_one({"_id": target_user_id})
     
-    # Helper do aktualizacji zagnieżdżonej
     async def update_nested_schedule(date_obj, shift_name, old_user, new_user):
-        date_str = date_obj.date().isoformat()
-        pull_path = f"schedule.{date_str}.{shift_name}.employees"
-        push_path = f"schedule.{date_str}.{shift_name}.employees"
+        """Aktualizuje zagnieżdżony grafik: usuwa starego pracownika, dodaje nowego."""
+        date_dt = date_obj if isinstance(date_obj, datetime) else datetime.combine(date_obj, time.min)
+        date_str = date_dt.date().isoformat() if isinstance(date_dt, datetime) else date_obj.isoformat()
         
-        # Znajdź grafik
+        emp_path = f"schedule.{date_str}.{shift_name}.employees"
+        old_id_str = str(old_user["_id"])
+        new_id_str = str(new_user["_id"])
+        
         query = {
             "franchise_code": franchise_code,
-            "start_date": {"$lte": date_obj},
-            "end_date": {"$gte": date_obj}
+            "start_date": {"$lte": date_dt},
+            "end_date": {"$gte": date_dt}
         }
         
-        # Usuń starego
-        await db.schedules.update_one(query, {"$pull": {pull_path: {"id": str(old_user["_id"])}}})
+        # Usuń starego — próbuj obie formy ID (string i ObjectId)
+        await db.schedules.update_one(query, {"$pull": {emp_path: {"id": old_id_str}}})
+        await db.schedules.update_one(query, {"$pull": {emp_path: {"id": old_user["_id"]}}})
         
-        # Dodaj nowego
+        # Dodaj nowego — ZAWSZE jako string (spójność z generatorem grafiku)
         new_user_data = {
-            "id": new_user["_id"],
+            "id": new_id_str,
             "first_name": new_user.get("first_name", ""),
             "last_name": new_user.get("last_name", "")
         }
-        await db.schedules.update_one(query, {"$push": {push_path: new_user_data}})
+        await db.schedules.update_one(query, {"$push": {emp_path: new_user_data}})
 
-    # Wykonaj zamianę w widoku
     # Zmiana 1: Requester wychodzi, Target wchodzi
     await update_nested_schedule(date1, shift1, user1, user2)
     
     # Zmiana 2: Target wychodzi, Requester wchodzi
     await update_nested_schedule(date2, shift2, user2, user1)
 
-    logger.info(f"Swap executed: {requester_id} <-> {target_user_id}")
+    logger.info(f"Swap executed successfully: {requester_id} <-> {target_user_id} | {shift1}@{date1} <-> {shift2}@{date2}")

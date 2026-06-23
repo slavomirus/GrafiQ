@@ -217,7 +217,7 @@ async def execute_swap(db: motor.motor_asyncio.AsyncIOMotorDatabase, swap: dict)
         
         # Dodaj nowego
         new_user_data = {
-            "id": str(new_user["_id"]),
+            "id": new_user["_id"],
             "first_name": new_user.get("first_name", ""),
             "last_name": new_user.get("last_name", "")
         }

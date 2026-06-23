@@ -166,8 +166,13 @@ class ScheduleGenerator:
             avail_by_user[a["user_id"]][d] = a
 
         for db_emp in self.db_employees:
+            is_franchisee = str(db_emp.get("_id")) == str(self.franchisee.get("_id"))
+            
             contract = db_emp.get("contract_type", "UZL")
-            if contract == models.ContractType.UOP.value:
+            if is_franchisee:
+                fte_or_target = float(self.store_settings.get("franchisee_monthly_hours", 0))
+                contract = "FRANCHISEE" # Użyj specjalnego identyfikatora
+            elif contract == models.ContractType.UOP.value:
                 fte_or_target = float(db_emp.get("fte", 1.0))
             else:
                 fte_or_target = float(db_emp.get("monthly_hours_target", 120))
@@ -274,7 +279,12 @@ class ScheduleGenerator:
         if emp.contract_type == 'UOP':
             if round(emp.worked_hours + shift.time_range.hours, 2) > round(emp.target_hours, 2):
                 return False
-                
+        # Dla franczyzobiorcy i UZ, pozwól na lekkie przekroczenie (10%), ale nie jeśli cel to 0
+        elif emp.target_hours > 0 and round(emp.worked_hours + shift.time_range.hours, 2) > round(emp.target_hours * 1.1, 2):
+             return False
+        elif emp.target_hours == 0 and shift.time_range.hours > 0:
+            return False
+
         return True
 
     def _assign(self, emp: Employee, shift: ShiftDemand):
@@ -306,15 +316,21 @@ class ScheduleGenerator:
         await self._gather_data(start_date, end_date)
         self._map_to_domain(start_date, end_date)
         
-        uop_emps = [e for e in self.employees if e.contract_type == 'UOP']
-        uzl_emps = [e for e in self.employees if e.contract_type == 'UZL']
+        uop_emps = [e for e in self.employees if e.contract_type == models.ContractType.UOP.value]
+        other_emps = [e for e in self.employees if e.contract_type != models.ContractType.UOP.value]
 
         # Wyliczenie Puli (Art. 130)
         full_uop_hours = calculate_uop_hours(start_date.year, start_date.month, 1.0)
         for emp in uop_emps:
             emp.target_hours = full_uop_hours * emp.fte_or_target
-        for emp in uzl_emps:
+        for emp in other_emps:
             emp.target_hours = emp.fte_or_target
+
+        # Filtruj pracowników z 0 godzin docelowych — nie biorą udziału w grafiku
+        zero_hour_employees = [e for e in self.employees if e.target_hours == 0]
+        for e in zero_hour_employees:
+            self.logs.append(f"[INFO] Pracownik {e.first_name} {e.last_name} pominięty — docelowe godziny = 0.")
+        self.employees = [e for e in self.employees if e.target_hours > 0]
 
         # Przygotowanie slotów (klonowanie dla każdego wymaganego pracownika)
         slots = []
@@ -351,8 +367,10 @@ class ScheduleGenerator:
                 for e in candidates:
                     if e.contract_type == 'UOP' and e.worked_hours + shift.time_range.hours > e.target_hours:
                         continue
-                    if e.contract_type == 'UZL' and e.worked_hours + shift.time_range.hours > e.target_hours * 1.2:
+                    # Dla UZ/Franczyzobiorcy pozwalamy na większą elastyczność, ale nie bez końca
+                    if e.contract_type != 'UOP' and e.target_hours > 0 and e.worked_hours + shift.time_range.hours > e.target_hours * 1.2:
                         continue
+                    
                     burn_rate = e.worked_hours / e.target_hours if e.target_hours > 0 else 1.0
                     valid_candidates.append((e, burn_rate))
                 
@@ -368,9 +386,11 @@ class ScheduleGenerator:
             candidates = []
             for e in self.employees:
                 if self._check_hard_constraints(e, shift):
+                    # Twardy limit dla UOP
                     if e.contract_type == 'UOP' and e.worked_hours + shift.time_range.hours > e.target_hours:
                         continue
-                    if e.contract_type == 'UZL' and e.worked_hours + shift.time_range.hours > e.target_hours * 1.2:
+                    # Elastyczny limit dla reszty
+                    if e.contract_type != 'UOP' and e.target_hours > 0 and e.worked_hours + shift.time_range.hours > e.target_hours * 1.2:
                         continue
                     candidates.append(e)
             
@@ -412,6 +432,10 @@ class ScheduleGenerator:
                             if (shift.time_range.start - assigned.time_range.end).total_seconds() / 3600.0 < 11: can_work = False
                         elif shift.time_range.end <= assigned.time_range.start:
                             if (assigned.time_range.start - shift.time_range.end).total_seconds() / 3600.0 < 11: can_work = False
+                            
+                    # Nie przydzielaj zmian pracownikom z docelowymi 0 godzin
+                    if can_work and e.target_hours == 0:
+                        can_work = False
                             
                     if can_work:
                         fallback_candidates.append(e)

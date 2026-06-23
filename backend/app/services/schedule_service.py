@@ -68,45 +68,48 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
     s_type = shift_type.lower()
     if s_type == "mid": s_type = "middle"
 
+    # Logika dla dni specjalnych (święta) i niedziel
+    special_day = False
+    open_time_str, close_time_str = None, None
+
     if date_str in holidays_map:
         holiday_info = holidays_map[date_str]
         if holiday_info.get("is_closed"):
             return ("00:00", "00:00")
-            
-        open_time = holiday_info.get("open_time", "08:00")
-        close_time = holiday_info.get("close_time", "15:00")
         
-        if isinstance(open_time, time): open_time = open_time.strftime("%H:%M")
-        if isinstance(close_time, time): close_time = close_time.strftime("%H:%M")
-        
-        return (open_time, close_time)
-
-    if date_obj.weekday() == 6:
+        open_time_str = holiday_info.get("open_time")
+        close_time_str = holiday_info.get("close_time")
+        special_day = True
+    elif date_obj.weekday() == 6: # Niedziela
         sunday_settings = opening_hours.get("sunday", {})
-        open_time = sunday_settings.get("from", "09:00")
-        close_time = sunday_settings.get("to", "21:00")
-        
-        if isinstance(open_time, time): open_time = open_time.strftime("%H:%M")
-        if isinstance(close_time, time): close_time = close_time.strftime("%H:%M")
+        open_time_str = sunday_settings.get("from", "09:00")
+        close_time_str = sunday_settings.get("to", "21:00")
+        special_day = True
+
+    if special_day:
+        if isinstance(open_time_str, time): open_time_str = open_time_str.strftime("%H:%M")
+        if isinstance(close_time_str, time): close_time_str = close_time_str.strftime("%H:%M")
 
         base_date = datetime(2000, 1, 1)
-        start_dt = datetime.combine(base_date, parse_t(open_time))
-        end_dt = datetime.combine(base_date, parse_t(close_time))
+        start_dt = datetime.combine(base_date, parse_t(open_time_str))
+        end_dt = datetime.combine(base_date, parse_t(close_time_str))
         if end_dt <= start_dt:
             end_dt += timedelta(days=1)
             
         duration_total = (end_dt - start_dt).total_seconds() / 3600.0
         
+        # Dzielimy dzień na pół, aby uzyskać zmianę poranną i zamykającą
         mid_dt = start_dt + timedelta(hours=duration_total / 2)
         mid_time_str = mid_dt.strftime("%H:%M")
         
         if s_type == "morning":
-            return (open_time, mid_time_str)
+            return (open_time_str, mid_time_str)
         elif s_type == "closing":
-            return (mid_time_str, close_time)
-        else:
-             return (open_time, close_time)
+            return (mid_time_str, close_time_str)
+        else: # Dla "middle" lub innych nieobsługiwanych, zwróć cały zakres
+             return (open_time_str, close_time_str)
 
+    # Logika dla standardowych dni roboczych
     default_shifts = {
         "morning": ("06:00", "14:30"),
         "middle": ("10:00", "18:00"),

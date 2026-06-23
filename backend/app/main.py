@@ -32,7 +32,7 @@ root_logger.setLevel(logging.INFO)
 # ------------------------------
 
 from .database import db_manager
-from .endpoints import auth, vacation, availability, schedule, users, reports, verification, stores, schedule_generator, schedule_management, settings, shift_swap, updates, payments
+from .endpoints import auth, vacation, availability, schedule, users, reports, verification, stores, schedule_generator, schedule_management, settings, shift_swap, updates, payments, webhooks
 from .services.seniority_service import update_employees_seniority
 
 logger = logging.getLogger(__name__)
@@ -113,5 +113,6 @@ app.include_router(settings.router, prefix="/settings", tags=["settings"])
 app.include_router(shift_swap.router, prefix="/swaps", tags=["swaps"])
 app.include_router(updates.router, prefix="/updates", tags=["updates"])
 app.include_router(payments.router, prefix="/payments", tags=["payments"])
+app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 
 logger.info("Aplikacja skonfigurowana i gotowa do przyjęcia zapytań.")

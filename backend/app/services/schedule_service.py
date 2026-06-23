@@ -500,17 +500,8 @@ async def get_employee_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabase, cu
                     if isinstance(shift_details, dict):
                         start_time_str = shift_details.get("start_time", "00:00")
                         end_time_str = shift_details.get("end_time", "00:00")
-                        start_iso = f"{date_str}T{start_time_str}:00" if len(start_time_str) == 5 else f"{date_str}T{start_time_str}"
-                        
-                        try:
-                            st = datetime.strptime(start_time_str, "%H:%M").time()
-                            et = datetime.strptime(end_time_str, "%H:%M").time()
-                            dt_start = datetime.strptime(date_str, "%Y-%m-%d")
-                            dt_end = dt_start
-                            if et < st: dt_end += timedelta(days=1)
-                            end_iso = dt_end.strftime("%Y-%m-%dT%H:%M:00")
-                        except ValueError:
-                            end_iso = f"{date_str}T{end_time_str}:00"
+                        start_iso = start_time_str
+                        end_iso = end_time_str
 
                         employees = shift_details.get("employees", [])
                         for emp in employees:

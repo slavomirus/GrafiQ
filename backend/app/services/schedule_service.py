@@ -460,6 +460,34 @@ async def publish_schedule_draft(db: motor.motor_asyncio.AsyncIOMotorDatabase, d
     await db.schedule_drafts.delete_one({"_id": draft_object_id})
     return {"detail": "Grafik został pomyślnie opublikowany."}
 
+async def delete_published_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabase, schedule_id: str, current_user: dict):
+    try:
+        schedule_object_id = ObjectId(schedule_id)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nieprawidłowy format ID grafiku.")
+
+    schedule = await db.schedules.find_one({"_id": schedule_object_id})
+    if not schedule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Grafik nie został znaleziony.")
+
+    if current_user.get("franchise_code") != schedule.get("franchise_code"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Brak uprawnień.")
+
+    franchise_code = schedule["franchise_code"]
+    start_date = schedule["start_date"]
+    end_date = schedule["end_date"]
+
+    # Usuń z schedules (główny dokument)
+    await db.schedules.delete_one({"_id": schedule_object_id})
+
+    # Usuń szczegółowe przypisania z schedule
+    await db.schedule.delete_many({
+        "franchise_code": franchise_code, 
+        "date": {"$gte": start_date, "$lte": end_date}
+    })
+
+    return {"detail": "Opublikowany grafik został pomyślnie usunięty."}
+
 async def get_employee_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabase, current_user: dict, month: Optional[int] = None, year: Optional[int] = None) -> List[dict]:
     franchise_code = current_user.get("franchise_code")
     query = {"franchise_code": franchise_code, "is_published": True}

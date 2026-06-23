@@ -170,6 +170,22 @@ async def publish_schedule_endpoint(
         logger.error(f"Nieoczekiwany błąd podczas publikowania grafiku {draft_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Wystąpił wewnętrzny błąd serwera.")
 
+@router.delete("/published/{schedule_id}", status_code=status.HTTP_200_OK)
+async def delete_published_schedule_endpoint(
+    schedule_id: str,
+    current_user: dict = Depends(get_current_admin_user),
+    db: motor.motor_asyncio.AsyncIOMotorDatabase = Depends(get_db)
+):
+    try:
+        from app.services.schedule_service import delete_published_schedule
+        result = await delete_published_schedule(db, schedule_id, current_user)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Nieoczekiwany błąd podczas usuwania grafiku {schedule_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Wystąpił wewnętrzny błąd serwera.")
+
 @router.get("/my-schedule", response_model=List[schemas.ScheduleResponse], status_code=status.HTTP_200_OK)
 async def get_my_schedule_endpoint(
     month: Optional[int] = Query(None, ge=1, le=12),

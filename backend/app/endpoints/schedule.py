@@ -223,7 +223,7 @@ async def get_monthly_schedule_pdf_endpoint(
         
         all_employees = await db.users.find({
             "franchise_code": franchise_code,
-            "role": models.UserRole.EMPLOYEE.value
+            "role": {"$in": [models.UserRole.EMPLOYEE.value, models.UserRole.FRANCHISEE.value]}
         }).to_list(length=None)
         
         schedule_data_wrapper = {
@@ -305,7 +305,7 @@ async def get_schedule_pdf_endpoint(
 
         all_employees = await db.users.find({
             "franchise_code": franchise_code,
-            "role": models.UserRole.EMPLOYEE.value
+            "role": {"$in": [models.UserRole.EMPLOYEE.value, models.UserRole.FRANCHISEE.value]}
         }).to_list(length=None)
 
         pdf_buffer = generate_schedule_pdf(schedule, store_settings, sick_leaves, all_employees)

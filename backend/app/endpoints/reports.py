@@ -55,7 +55,10 @@ async def get_hours_report(
 
         # Filtrowanie po franczyzie (jeśli nie podano konkretnego user_id lub jesteśmy adminem sklepu)
         if franchise_code and not user_id:
-            franchise_users = await db.users.find({"franchise_code": franchise_code}).to_list(length=None)
+            franchise_users = await db.users.find({
+                "franchise_code": franchise_code,
+                "role": {"$in": [models.UserRole.EMPLOYEE.value, models.UserRole.FRANCHISEE.value]}
+            }).to_list(length=None)
             franchise_user_ids = [user["_id"] for user in franchise_users]
             query["user_id"] = {"$in": franchise_user_ids}
 
@@ -140,7 +143,10 @@ async def get_hours_report_pdf_endpoint(
             # If no specific user, filter by franchise (for admin/franchisee)
             franchise_code = current_user.get("franchise_code")
             if franchise_code:
-                franchise_users = await db.users.find({"franchise_code": franchise_code}).to_list(length=None)
+                franchise_users = await db.users.find({
+                    "franchise_code": franchise_code,
+                    "role": {"$in": [models.UserRole.EMPLOYEE.value, models.UserRole.FRANCHISEE.value]}
+                }).to_list(length=None)
                 franchise_user_ids = [user["_id"] for user in franchise_users]
                 query["user_id"] = {"$in": franchise_user_ids}
 

@@ -307,6 +307,78 @@ class ScheduleGenerator:
 
         return normalized
 
+    def _count_consecutive_days(self, emp: Employee, shift_date: date) -> int:
+        """Liczy ile kolejnych dni pracy (wliczając shift_date) miałby pracownik."""
+        worked_dates = set(a.time_range.start.date() for a in emp.assigned_shifts)
+        worked_dates.add(shift_date)
+        
+        consecutive = 1
+        # Sprawdź wstecz
+        d = shift_date - timedelta(days=1)
+        while d in worked_dates:
+            consecutive += 1
+            d -= timedelta(days=1)
+        # Sprawdź do przodu (na wypadek wypełnionych przyszłych slotów)
+        d = shift_date + timedelta(days=1)
+        while d in worked_dates:
+            consecutive += 1
+            d += timedelta(days=1)
+        
+        return consecutive
+
+    def _check_weekly_rest(self, emp: Employee, shift: ShiftDemand) -> bool:
+        """
+        Art. 133 KP: Pracownik ma prawo do co najmniej 35h nieprzerwanego
+        odpoczynku w każdym tygodniu (7-dniowym oknie).
+        Sprawdza czy dodanie tej zmiany nie naruszy tego wymogu.
+        """
+        shift_date = shift.time_range.start.date()
+        
+        # Zbierz wszystkie zmiany w oknie 7 dni wokół nowej zmiany
+        window_start = shift_date - timedelta(days=6)
+        window_end = shift_date + timedelta(days=6)
+        
+        relevant_shifts = [a for a in emp.assigned_shifts 
+                          if window_start <= a.time_range.start.date() <= window_end]
+        relevant_shifts.append(shift)  # Dodaj proponowaną zmianę
+        relevant_shifts.sort(key=lambda s: s.time_range.start)
+        
+        # Dla każdego 7-dniowego okna, sprawdź czy jest przerwa >= 35h
+        for week_start_offset in range(-6, 1):
+            week_start = shift_date + timedelta(days=week_start_offset)
+            week_end = week_start + timedelta(days=6)
+            
+            week_shifts = sorted(
+                [s for s in relevant_shifts if week_start <= s.time_range.start.date() <= week_end],
+                key=lambda s: s.time_range.start
+            )
+            
+            if len(week_shifts) <= 1:
+                continue  # Wystarczająco dużo odpoczynku
+            
+            # Sprawdź najdłuższą przerwę między zmianami w tym tygodniu
+            max_gap_hours = 0.0
+            
+            # Przerwa przed pierwszą zmianą w tygodniu
+            week_start_dt = datetime.combine(week_start, time.min)
+            first_gap = (week_shifts[0].time_range.start - week_start_dt).total_seconds() / 3600.0
+            max_gap_hours = max(max_gap_hours, first_gap)
+            
+            # Przerwy między zmianami
+            for i in range(len(week_shifts) - 1):
+                gap = (week_shifts[i+1].time_range.start - week_shifts[i].time_range.end).total_seconds() / 3600.0
+                max_gap_hours = max(max_gap_hours, gap)
+            
+            # Przerwa po ostatniej zmianie w tygodniu
+            week_end_dt = datetime.combine(week_end + timedelta(days=1), time.min)
+            last_gap = (week_end_dt - week_shifts[-1].time_range.end).total_seconds() / 3600.0
+            max_gap_hours = max(max_gap_hours, last_gap)
+            
+            if max_gap_hours < 35.0:
+                return False  # Brak wystarczającego odpoczynku tygodniowego
+        
+        return True
+
     def _check_hard_constraints(self, emp: Employee, shift: ShiftDemand) -> bool:
         for unav in emp.unavailabilities:
             if unav.overlaps(shift.time_range):
@@ -326,6 +398,21 @@ class ScheduleGenerator:
             elif shift.time_range.end <= assigned.time_range.start:
                 gap = (assigned.time_range.start - shift.time_range.end).total_seconds() / 3600.0
                 if gap < 11: return False
+
+        # Art. 147 KP: Maksymalna liczba kolejnych dni pracy
+        shift_date = shift.time_range.start.date()
+        consecutive = self._count_consecutive_days(emp, shift_date)
+        if emp.contract_type == 'UOP':
+            if consecutive > 5:  # UOP: max 5 kolejnych dni (Art. 147 KP)
+                return False
+        else:
+            if consecutive > 6:  # UZ/Franczyzobiorca: max 6 kolejnych dni
+                return False
+
+        # Art. 133 KP: 35h nieprzerwanego odpoczynku tygodniowego (tylko UOP)
+        if emp.contract_type == 'UOP':
+            if not self._check_weekly_rest(emp, shift):
+                return False
 
         if emp.contract_type == 'UOP':
             if round(emp.worked_hours + shift.time_range.hours, 2) > round(emp.target_hours, 2):
@@ -372,6 +459,25 @@ class ScheduleGenerator:
                 score += 10.0
             else:
                 score -= 5.0
+
+        # 4. Kara za klasteryzację — rozkład zmian równomiernie w miesiącu
+        worked_dates = set(a.time_range.start.date() for a in emp.assigned_shifts)
+        
+        # 4a. Progresywna kara za kolejne dni pracy z rzędu
+        consecutive_before = 0
+        d = shift_date - timedelta(days=1)
+        while d in worked_dates:
+            consecutive_before += 1
+            d -= timedelta(days=1)
+        # Każdy kolejny dzień z rzędu = coraz większa kara (1: -5, 2: -15, 3: -30, 4: -50, 5: -75)
+        score -= consecutive_before * (consecutive_before + 1) * 2.5
+
+        # 4b. Kara za brak dnia wolnego w ostatnich 7 dniach
+        recent_work_days = sum(1 for i in range(1, 7) if (shift_date - timedelta(days=i)) in worked_dates)
+        if recent_work_days >= 5:
+            score -= 40.0  # Silna kara jeśli pracował 5+ z ostatnich 6 dni
+        elif recent_work_days >= 4:
+            score -= 15.0
 
         return score
 
@@ -483,8 +589,8 @@ class ScheduleGenerator:
             if shift.required_employees > 0:
                 fallback_candidates = []
                 for e in self.employees:
-                    # Zmodyfikowane Hard Constraints (omijamy preferencje dni, limity godzin, 
-                    # ale ZACHOWUJEMY minimum 11h, 1 zmianę/dzień i brak nachodzenia na urlop/inną zmianę)
+                    # Zmodyfikowane Hard Constraints (omijamy limity godzin, 
+                    # ale ZACHOWUJEMY: 11h odpoczynek, 1 zmianę/dzień, urlopy, kolejne dni)
                     can_work = True
                     for unav in e.unavailabilities:
                         if unav.overlaps(shift.time_range): can_work = False
@@ -495,6 +601,14 @@ class ScheduleGenerator:
                             if (shift.time_range.start - assigned.time_range.end).total_seconds() / 3600.0 < 11: can_work = False
                         elif shift.time_range.end <= assigned.time_range.start:
                             if (assigned.time_range.start - shift.time_range.end).total_seconds() / 3600.0 < 11: can_work = False
+                    
+                    # Limit kolejnych dni pracy (nawet w fallback)
+                    if can_work:
+                        shift_date = shift.time_range.start.date()
+                        consecutive = self._count_consecutive_days(e, shift_date)
+                        max_consecutive = 6 if e.contract_type == 'UOP' else 7
+                        if consecutive > max_consecutive:
+                            can_work = False
                             
                     # Nie przydzielaj zmian pracownikom z docelowymi 0 godzin
                     if can_work and e.target_hours == 0:

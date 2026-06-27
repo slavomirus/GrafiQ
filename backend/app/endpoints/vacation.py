@@ -100,6 +100,51 @@ async def populate_user_details(db, vacations, franchise_code):
             
     return vacations
 
+
+@router.get("/deadline")
+async def get_vacation_deadline(
+    current_user: dict = Depends(get_current_active_user),
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+):
+    """
+    Zwraca termin składania wniosków urlopowych na kolejny miesiąc.
+    Dostępne dla wszystkich zalogowanych użytkowników.
+    """
+    franchise_code = current_user.get("franchise_code")
+    if not franchise_code:
+        raise HTTPException(status_code=400, detail="Użytkownik nie jest przypisany do sklepu")
+
+    settings = await db.storesettings.find_one({"franchise_code": franchise_code})
+    deadline_day = 20  # domyślna wartość
+    if settings:
+        deadline_day = settings.get("vacation_deadline_day", 20)
+
+    now = datetime.utcnow()
+    # Termin dyspozycji to deadline_day bieżącego miesiąca (na urlopy przyszłego miesiąca)
+    # Jeśli już minął deadline w tym miesiącu, pokażemy deadline na przyszły miesiąc
+    current_deadline = datetime(now.year, now.month, min(deadline_day, 28))
+    
+    if now.day > deadline_day:
+        # Następny miesiąc
+        if now.month == 12:
+            next_deadline = datetime(now.year + 1, 1, min(deadline_day, 28))
+        else:
+            next_deadline = datetime(now.year, now.month + 1, min(deadline_day, 28))
+        deadline_date = next_deadline
+    else:
+        deadline_date = current_deadline
+
+    days_left = (deadline_date - now).days
+
+    return {
+        "deadline_day": deadline_day,
+        "deadline_date": deadline_date.strftime("%Y-%m-%d"),
+        "days_left": max(0, days_left),
+        "is_overdue": now.day > deadline_day,
+    }
+
+
+
 @router.get("/store-vacations", response_model=Dict[str, List[schemas.Vacation]])
 async def get_store_vacations(
     year: int = Query(..., description="Rok"),

@@ -186,6 +186,9 @@ class StoreSettingsBase(BaseModel):
         )
     )
 
+    # Dzień miesiąca (1-28), do którego pracownicy muszą złożyć wniosek urlopowy
+    vacation_deadline_day: int = Field(default=20, ge=1, le=28, description="Dzień miesiąca - termin składania wniosków urlopowych")
+
 class StoreSettingsCreate(StoreSettingsBase):
     pass
 

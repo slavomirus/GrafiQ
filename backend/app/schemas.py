@@ -467,6 +467,11 @@ class ForgotPasswordRequest(BaseModel):
 class ForgotPasswordResponse(MessageResponse):
     pass
 
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    otp_code: str
+    new_password: SecretStr
+
 # ====================================================================
 # Schematy Aplikacji (Dostępność, Grafik, Urlopy, etc.)
 # ====================================================================

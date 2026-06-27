@@ -194,10 +194,12 @@ async def request_password_reset(
     otp = ''.join(secrets.choice('0123456789') for _ in range(6))
     hashed_otp = security.get_password_hash(otp)
     
+    # Zapisujemy zahashowany OTP i czas wygaśnięcia (15 minut)
     await db.users.update_one(
         {"_id": user["_id"]},
         {"$set": {
-            "hashed_password": hashed_otp,
+            "password_reset_otp": hashed_otp,
+            "password_reset_otp_expires_at": datetime.utcnow() + timedelta(minutes=15),
             "status": models.UserStatus.NEEDS_PASSWORD_CHANGE.value
         }}
     )
@@ -206,3 +208,47 @@ async def request_password_reset(
     await send_otp_email(email, user.get("first_name", "Użytkowniku"), otp)
     
     return {"message": "Jeśli podany adres e-mail istnieje w naszej bazie, wysłano na niego nowe hasło tymczasowe."}
+
+
+@router.post("/reset-password", response_model=schemas.MessageResponse)
+async def reset_password_with_otp(
+    request_data: schemas.ResetPasswordRequest,
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+):
+    """
+    Weryfikuje kod OTP i ustawia nowe hasło — bez konieczności logowania tymczasowym hasłem.
+    Flow: ForgotPassword (email) → ten endpoint (email + otp + nowe_hasło).
+    """
+    user = await db.users.find_one({"email": request_data.email})
+
+    if not user:
+        raise HTTPException(status_code=400, detail="Nieprawidłowy kod lub adres e-mail.")
+
+    stored_otp = user.get("password_reset_otp")
+    otp_expires = user.get("password_reset_otp_expires_at")
+
+    if not stored_otp or not otp_expires:
+        raise HTTPException(status_code=400, detail="Nie znaleziono aktywnego kodu resetowania hasła. Wyślij kod ponownie.")
+
+    if datetime.utcnow() > otp_expires:
+        raise HTTPException(status_code=400, detail="Kod resetowania hasła wygasł. Wyślij kod ponownie.")
+
+    if not security.verify_password(request_data.otp_code, stored_otp):
+        raise HTTPException(status_code=400, detail="Nieprawidłowy kod weryfikacyjny.")
+
+    new_hashed_password = security.get_password_hash(request_data.new_password.get_secret_value())
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "hashed_password": new_hashed_password,
+            "status": models.UserStatus.ACTIVE.value,
+        },
+        "$unset": {
+            "password_reset_otp": "",
+            "password_reset_otp_expires_at": ""
+        }}
+    )
+
+    return {"message": "Hasło zostało pomyślnie zmienione. Możesz teraz się zalogować."}
+

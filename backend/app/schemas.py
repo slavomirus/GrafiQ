@@ -458,6 +458,12 @@ class PasswordReset(BaseModel):
 class SetInitialPasswordRequest(BaseModel):
     new_password: SecretStr
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ForgotPasswordResponse(MessageResponse):
+    pass
+
 # ====================================================================
 # Schematy Aplikacji (Dostępność, Grafik, Urlopy, etc.)
 # ====================================================================
@@ -678,6 +684,7 @@ class VacationPDFResponse(BaseModel):
 # ====================================================================
 class SwapStatus(str, Enum):
     REQUESTED = "requested"
+    AVAILABLE = "available"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
     CANCELLED = "cancelled"
@@ -695,18 +702,23 @@ class SwapResponseRequest(BaseModel):
 class ShiftSwapResponse(BaseModel):
     id: PyObjectId = Field(alias="_id", serialization_alias="_id")
     requester_id: PyObjectId
-    target_user_id: PyObjectId
+    requester_name: Optional[str] = None
+    target_user_id: Optional[PyObjectId] = None
     franchise_code: str
 
     my_date: date
     my_shift_name: str
 
-    target_date: date
-    target_shift_name: str
+    target_date: Optional[date] = None
+    target_shift_name: Optional[str] = None
 
     status: SwapStatus
     created_at: datetime
     updated_at: Optional[datetime] = None
+
+class ShiftOfferCreate(BaseModel):
+    my_date: date
+    my_shift_name: str
 
     class Config(MongoConfig):
         pass

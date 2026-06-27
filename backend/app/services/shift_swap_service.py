@@ -241,3 +241,150 @@ async def execute_swap(db: motor.motor_asyncio.AsyncIOMotorDatabase, swap: dict)
     await update_nested_schedule(date2, shift2, user2, user1)
 
     logger.info(f"Swap executed successfully: {requester_id} <-> {target_user_id} | {shift1}@{date1} <-> {shift2}@{date2}")
+
+# --- GIEŁDA ZMIAN (MARKETPLACE) ---
+
+async def offer_shift(
+    db: motor.motor_asyncio.AsyncIOMotorDatabase,
+    request: schemas.ShiftOfferCreate,
+    current_user: dict
+) -> schemas.ShiftSwapResponse:
+    
+    requester_id = current_user["_id"]
+    franchise_code = current_user.get("franchise_code")
+    requester_oid = ObjectId(requester_id) if not isinstance(requester_id, ObjectId) else requester_id
+
+    requester_shift = await db.schedule.find_one({
+        "franchise_code": franchise_code,
+        "user_id": requester_oid,
+        "date": datetime.combine(request.my_date, time.min),
+        "shift_name": request.my_shift_name
+    })
+    
+    if not requester_shift:
+        raise HTTPException(status_code=404, detail="Nie znaleziono Twojej zmiany w podanym dniu.")
+        
+    swap_doc = {
+        "requester_id": requester_id,
+        "franchise_code": franchise_code,
+        "my_date": datetime.combine(request.my_date, time.min),
+        "my_shift_name": request.my_shift_name,
+        "status": schemas.SwapStatus.AVAILABLE.value,
+        "created_at": datetime.utcnow()
+    }
+    
+    result = await db.shift_swaps.insert_one(swap_doc)
+    created_offer = await db.shift_swaps.find_one({"_id": result.inserted_id})
+    created_offer["my_date"] = created_offer["my_date"].date()
+    
+    # Powiadom wszystkich pracowników z tego samego sklepu!
+    try:
+        users_in_store = await db.users.find({"franchise_code": franchise_code, "_id": {"$ne": requester_oid}, "role": "employee"}).to_list(length=None)
+        offerer_name = f"{current_user.get('first_name', '')} {current_user.get('last_name', '')}"
+        
+        for u in users_in_store:
+            await send_push_to_user(
+                db, u["_id"], "Nowa zmiana na Giełdzie!", f"{offerer_name} oddaje zmianę {request.my_shift_name} w dniu {request.my_date}. Zobacz giełdę!",
+                data={"type": "new_offer"}
+            )
+    except Exception as e:
+        logger.error(f"Powiadomienia o giełdzie błąd: {e}")
+
+    return created_offer
+
+async def execute_one_way_swap(
+    db: motor.motor_asyncio.AsyncIOMotorDatabase, 
+    swap: dict, 
+    target_user_id: ObjectId
+):
+    franchise_code = swap["franchise_code"]
+    requester_id = ObjectId(swap["requester_id"]) if not isinstance(swap["requester_id"], ObjectId) else swap["requester_id"]
+    date1 = swap["my_date"]
+    shift1 = swap["my_shift_name"]
+    
+    doc1 = await db.schedule.find_one({"franchise_code": franchise_code, "user_id": requester_id, "date": date1, "shift_name": shift1})
+    if not doc1:
+        raise HTTPException(status_code=500, detail="Błąd: nie znaleziono zmiany wystawiającego.")
+
+    await db.schedule.update_one({"_id": doc1["_id"]}, {"$set": {"user_id": target_user_id}})
+    
+    user1 = await db.users.find_one({"_id": requester_id})
+    user2 = await db.users.find_one({"_id": target_user_id})
+    
+    date_dt = date1 if isinstance(date1, datetime) else datetime.combine(date1, time.min)
+    date_str = date_dt.date().isoformat() if isinstance(date_dt, datetime) else date1.isoformat()
+    emp_path = f"schedule.{date_str}.{shift1}.employees"
+    
+    query = {
+        "franchise_code": franchise_code,
+        "start_date": {"$lte": date_dt},
+        "end_date": {"$gte": date_dt}
+    }
+    
+    await db.schedules.update_one(query, {"$pull": {emp_path: {"id": str(user1["_id"])}}})
+    await db.schedules.update_one(query, {"$pull": {emp_path: {"id": user1["_id"]}}})
+    
+    new_user_data = {
+        "id": str(user2["_id"]),
+        "first_name": user2.get("first_name", ""),
+        "last_name": user2.get("last_name", "")
+    }
+    await db.schedules.update_one(query, {"$push": {emp_path: new_user_data}})
+
+async def take_shift(
+    db: motor.motor_asyncio.AsyncIOMotorDatabase,
+    swap_id: str,
+    current_user: dict
+) -> schemas.MessageResponse:
+    try:
+        oid = ObjectId(swap_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid ID")
+
+    swap = await db.shift_swaps.find_one({"_id": oid})
+    if not swap:
+        raise HTTPException(status_code=404, detail="Oferta nie znaleziona.")
+    
+    if swap["status"] != schemas.SwapStatus.AVAILABLE.value:
+        raise HTTPException(status_code=400, detail="Ta zmiana nie jest już dostępna.")
+        
+    taker_id = current_user["_id"]
+    if str(swap["requester_id"]) == str(taker_id):
+        raise HTTPException(status_code=400, detail="Nie możesz przejąć własnej zmiany.")
+
+    # Validation
+    validator = ScheduleValidator(db)
+    swap_data = {
+        "requester_id": swap["requester_id"],
+        "target_user_id": taker_id,
+        "franchise_code": swap["franchise_code"],
+        "my_date": swap["my_date"].date(),
+        "my_shift_name": swap["my_shift_name"],
+        "target_date": swap["my_date"].date(), # fake target
+        "target_shift_name": "none" # fake target
+    }
+    
+    is_valid, reason = await validator.validate_swap(swap_data)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=f"Wymiana niemożliwa: {reason}")
+
+    await execute_one_way_swap(db, swap, taker_id)
+    
+    await db.shift_swaps.update_one(
+        {"_id": oid},
+        {"$set": {
+            "status": schemas.SwapStatus.ACCEPTED.value, 
+            "target_user_id": taker_id,
+            "target_date": swap["my_date"],
+            "target_shift_name": swap["my_shift_name"],
+            "updated_at": datetime.utcnow()
+        }}
+    )
+    
+    taker_name = f"{current_user.get('first_name')} {current_user.get('last_name')}"
+    await send_push_to_user(
+        db, swap["requester_id"], "Ktoś przejął Twoją zmianę!", f"{taker_name} przejmuje Twoją zmianę w dniu {swap['my_date'].date()}.",
+        data={"type": "swap_taken"}
+    )
+    
+    return {"message": "Zmiana została przypisana do Ciebie."}

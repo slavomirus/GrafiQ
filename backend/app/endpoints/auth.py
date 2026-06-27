@@ -9,7 +9,7 @@ import secrets
 
 from ..database import get_db
 from .. import models, schemas, security
-from ..email_service import send_verification_code_email
+from ..email_service import send_verification_code_email, send_otp_email
 from ..dependencies import get_current_user
 from ..config import settings
 
@@ -176,3 +176,33 @@ async def set_initial_password(
 
     access_token = security.create_access_token(data={"sub": str(current_user["_id"])})
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.post("/forgot-password", response_model=schemas.ForgotPasswordResponse)
+async def request_password_reset(
+    request_data: schemas.ForgotPasswordRequest,
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+):
+    """Generuje jednorazowe hasło OTP i wysyła na e-mail użytkownika. Wymusza zmianę hasła po zalogowaniu."""
+    email = request_data.email
+    user = await db.users.find_one({"email": email})
+    
+    if not user:
+        # Zwracamy zawsze sukces, aby nie ujawniać czy e-mail istnieje w bazie
+        return {"message": "Jeśli podany adres e-mail istnieje w naszej bazie, wysłano na niego nowe hasło tymczasowe."}
+        
+    otp = ''.join(secrets.choice('0123456789') for _ in range(6))
+    hashed_otp = security.get_password_hash(otp)
+    
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "hashed_password": hashed_otp,
+            "status": models.UserStatus.NEEDS_PASSWORD_CHANGE.value
+        }}
+    )
+    
+    # Wysyłanie e-maila w tle / bez blokowania, ewentualnie dodaj background task
+    await send_otp_email(email, user.get("first_name", "Użytkowniku"), otp)
+    
+    return {"message": "Jeśli podany adres e-mail istnieje w naszej bazie, wysłano na niego nowe hasło tymczasowe."}

@@ -7,7 +7,7 @@ import motor.motor_asyncio
 from ..database import get_db
 from ..dependencies import get_current_active_user, get_current_admin_user
 from .. import models, schemas
-from ..services.shift_swap_service import create_swap_request, respond_to_swap
+from ..services.shift_swap_service import create_swap_request, respond_to_swap, offer_shift, take_shift
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -27,6 +27,53 @@ async def request_shift_swap(
         logger.error(f"Error creating swap request: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+@router.post("/offer", response_model=schemas.ShiftSwapResponse)
+async def offer_shift_endpoint(
+    request: schemas.ShiftOfferCreate,
+    current_user: dict = Depends(get_current_active_user),
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+):
+    """Giełda Zmian: Oddaj zmianę do puli."""
+    try:
+        return await offer_shift(db, request, current_user)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error offering shift: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@router.get("/available", response_model=List[schemas.ShiftSwapResponse])
+async def get_available_shifts(
+    current_user: dict = Depends(get_current_active_user),
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+):
+    """Giełda Zmian: Pobierz dostępne zmiany do wzięcia."""
+    franchise_code = current_user.get("franchise_code")
+    swaps = await db.shift_swaps.find({
+        "franchise_code": franchise_code,
+        "status": schemas.SwapStatus.AVAILABLE.value,
+        "requester_id": {"$ne": current_user["_id"]}
+    }).sort("created_at", -1).to_list(length=None)
+    
+    for s in swaps:
+        s["my_date"] = s["my_date"].date()
+        if s.get("target_date"):
+            s["target_date"] = s["target_date"].date()
+        u = await db.users.find_one({"_id": s["requester_id"]})
+        if u:
+            s["requester_name"] = f"{u.get('first_name', '')} {u.get('last_name', '')}"
+            
+    return swaps
+
+@router.post("/{swap_id}/take", response_model=schemas.MessageResponse)
+async def take_shift_endpoint(
+    swap_id: str,
+    current_user: dict = Depends(get_current_active_user),
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+):
+    """Giełda Zmian: Przejmij wystawionę zmianę."""
+    return await take_shift(db, swap_id, current_user)
+
 @router.get("/my-requests", response_model=List[schemas.ShiftSwapResponse])
 async def get_my_swap_requests(
     current_user: dict = Depends(get_current_active_user),
@@ -45,7 +92,11 @@ async def get_my_swap_requests(
     # Fix dates for Pydantic
     for s in swaps:
         s["my_date"] = s["my_date"].date()
-        s["target_date"] = s["target_date"].date()
+        if s.get("target_date"):
+            s["target_date"] = s["target_date"].date()
+        u = await db.users.find_one({"_id": s["requester_id"]})
+        if u:
+            s["requester_name"] = f"{u.get('first_name', '')} {u.get('last_name', '')}"
         
     return swaps
 
@@ -79,6 +130,10 @@ async def get_store_swap_history(
     
     for s in swaps:
         s["my_date"] = s["my_date"].date()
-        s["target_date"] = s["target_date"].date()
+        if s.get("target_date"):
+            s["target_date"] = s["target_date"].date()
+        u = await db.users.find_one({"_id": s["requester_id"]})
+        if u:
+            s["requester_name"] = f"{u.get('first_name', '')} {u.get('last_name', '')}"
         
     return swaps

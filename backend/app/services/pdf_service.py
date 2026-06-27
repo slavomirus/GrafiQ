@@ -312,81 +312,153 @@ def generate_monthly_schedule_pdf(month: int, year: int, schedule_data: dict, st
     buffer.seek(0)
     return buffer
 
-def generate_hours_report_pdf(report_data: List[Dict[str, Any]], start_date: date, end_date: date) -> BytesIO:
+def generate_hours_report_pdf(report_data: List[Dict[str, Any]], start_date: date, end_date: date, sick_leaves: List[dict] = None) -> BytesIO:
+    if sick_leaves is None:
+        sick_leaves = []
+    
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=20)
     elements = []
     
     styles = getSampleStyleSheet()
     styles['Normal'].fontName = FONT_NAME
-    styles['Heading2'].fontName = FONT_NAME_BOLD
+    styles['Title'].fontName = FONT_NAME_BOLD
     
-    grouped_data = {}
+    elements.append(Paragraph(f"Tabelaryczny Grafik Pracy", styles['Title']))
+    elements.append(Paragraph(f"Okres: {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}", styles['Normal']))
+    elements.append(Spacer(1, 15))
+    
+    # 1. Zbierz unikalnych pracowników
+    emp_map = {}
     for entry in report_data:
-        user_id = entry['user_id']
-        if user_id not in grouped_data:
-            grouped_data[user_id] = {
-                "first_name": entry.get("first_name", ""),
-                "last_name": entry.get("last_name", ""),
-                "entries": [],
-                "total_hours": 0.0
+        uid = entry['user_id']
+        if uid not in emp_map:
+            emp_map[uid] = {
+                'id': uid,
+                'first_name': entry.get('first_name', ''),
+                'last_name': entry.get('last_name', '')
             }
-        grouped_data[user_id]["entries"].append(entry)
-        grouped_data[user_id]["total_hours"] += entry.get("hours", 0.0)
+    
+    sorted_employees = sorted(emp_map.values(), key=lambda x: (x['last_name'], x['first_name']))
+    emp_ids = [e['id'] for e in sorted_employees]
+    
+    header_row = ["Dzień"]
+    for emp in sorted_employees:
+        fn = emp.get('first_name', '')
+        ln = emp.get('last_name', '')
+        initial = ln[0] + "." if ln else ""
+        header_row.append(f"{fn} {initial}")
+        
+    table_data = [header_row]
+    employee_totals = {eid: 0.0 for eid in emp_ids}
+    
+    # 2. Mapowanie danych
+    schedule_by_date = {}
+    for entry in report_data:
+        d = entry['date']
+        if isinstance(d, datetime): d = d.date()
+        date_str = d.strftime("%Y-%m-%d")
+        
+        if date_str not in schedule_by_date:
+            schedule_by_date[date_str] = {}
+            
+        uid = entry['user_id']
+        if uid not in schedule_by_date[date_str]:
+            schedule_by_date[date_str][uid] = []
+            
+        schedule_by_date[date_str][uid].append(entry)
+        employee_totals[uid] += entry.get("hours", 0.0)
 
-    for user_id, data in grouped_data.items():
-        header_text = f"Raport Godzin: {data['first_name']} {data['last_name']}"
-        elements.append(Paragraph(header_text, styles['Heading2']))
+    # 3. Generowanie wierszy dla każdego dnia
+    dates = []
+    curr = start_date
+    while curr <= end_date:
+        dates.append(curr)
+        curr += timedelta(days=1)
         
-        period_text = f"Okres: {start_date} - {end_date}"
-        elements.append(Paragraph(period_text, styles['Normal']))
-        elements.append(Spacer(1, 10))
+    pl_weekdays = {0: "Poniedziałek", 1: "Wtorek", 2: "Środa", 3: "Czwartek", 4: "Piątek", 5: "Sobota", 6: "Niedziela"}
         
-        table_data = [['Data', 'Od', 'Do', 'Godziny']]
+    for d in dates:
+        date_str = d.strftime("%Y-%m-%d")
+        day_name = pl_weekdays[d.weekday()]
+        row = [f"{d.day}. {day_name}"]
         
-        sorted_entries = sorted(data['entries'], key=lambda x: x['date'])
-        
-        for entry in sorted_entries:
-            d = entry['date']
-            if isinstance(d, datetime): d = d.date()
+        for emp_id in emp_ids:
+            cell_text = ""
             
-            start_t = entry['start_time']
-            end_t = entry['end_time']
-            
-            if isinstance(start_t, (time, datetime)):
-                start_t = start_t.strftime("%H:%M")
-            if isinstance(end_t, (time, datetime)):
-                end_t = end_t.strftime("%H:%M")
-                
-            row = [
-                str(d),
-                str(start_t),
-                str(end_t),
-                f"{entry['hours']:.2f}"
-            ]
-            table_data.append(row)
-            
-        table_data.append(['', '', 'SUMA:', f"{data['total_hours']:.2f}"])
+            if is_on_sick_leave(emp_id, d, sick_leaves):
+                cell_text = "L4"
+            else:
+                entries = schedule_by_date.get(date_str, {}).get(emp_id, [])
+                if entries:
+                    parts = []
+                    for e in entries:
+                        s_name = e.get("shift_name", "").lower()
+                        # Mapowanie nazw zmian na litery
+                        if s_name in ["morning", "rano", "poranna"]:
+                            parts.append("R")
+                        elif s_name in ["middle", "środek", "pośrednia"]:
+                            parts.append("P")
+                        elif s_name in ["closing", "wieczór", "zamykająca", "zamknięcie"]:
+                            parts.append("Z")
+                        elif "custom" in s_name or s_name == "":
+                            # Jeśli to zmiana modyfikowana, pokaż konkretne godziny
+                            s_t = e.get("start_time")
+                            e_t = e.get("end_time")
+                            if isinstance(s_t, (time, datetime)): s_t = s_t.strftime("%H:%M")
+                            if isinstance(e_t, (time, datetime)): e_t = e_t.strftime("%H:%M")
+                            parts.append(f"{s_t}-{e_t}")
+                        else:
+                            # Inne kody jak np. "dost", "szk"
+                            parts.append(e.get("shift_name"))
+                            
+                    cell_text = "\n".join(parts)
+                    
+            row.append(cell_text)
+        table_data.append(row)
         
-        table = Table(table_data, colWidths=[100, 80, 80, 80])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), FONT_NAME_BOLD),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-            ('GRID', (0, 0), (-1, -2), 1, colors.black),
-            ('LINEABOVE', (0, -1), (-1, -1), 1, colors.black),
-            ('FONTNAME', (0, -1), (-1, -1), FONT_NAME_BOLD),
-            ('FONTNAME', (0, 1), (-1, -2), FONT_NAME), 
-        ]))
-        
-        elements.append(table)
-        elements.append(Spacer(1, 20))
-
-    if not grouped_data:
+    summary_row = ["Suma godzin:"]
+    for emp_id in emp_ids:
+        summary_row.append(f"{employee_totals[emp_id]:.0f}h")
+    table_data.append(summary_row)
+    
+    # 4. Stylizacja
+    num_emps = len(emp_ids)
+    if num_emps == 0:
         elements.append(Paragraph("Brak danych dla wybranego okresu.", styles['Normal']))
-
+        doc.build(elements)
+        buffer.seek(0)
+        return buffer
+        
+    available_width = 802 # A4 landscape width approx
+    first_col_width = 90
+    col_width = (available_width - first_col_width) / num_emps
+    if col_width > 80: col_width = 80
+    
+    table = Table(table_data, colWidths=[first_col_width] + [col_width] * num_emps, repeatRows=1)
+    
+    style_cmds = [
+        ('FONTNAME', (0, 0), (-1, -1), FONT_NAME),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+        ('FONTNAME', (0, 0), (-1, 0), FONT_NAME_BOLD),
+        ('BACKGROUND', (0, 1), (0, -2), colors.whitesmoke),
+        ('ALIGN', (0, 1), (0, -2), 'LEFT'),
+        ('FONTNAME', (0, 1), (0, -2), FONT_NAME_BOLD),
+        ('BACKGROUND', (0, -1), (-1, -1), colors.lightgrey),
+        ('FONTNAME', (0, -1), (-1, -1), FONT_NAME_BOLD),
+    ]
+    
+    for r_idx, row in enumerate(table_data):
+        for c_idx, cell in enumerate(row):
+            if "L4" in str(cell): style_cmds.append(('BACKGROUND', (c_idx, r_idx), (c_idx, r_idx), colors.pink))
+            elif "Zamknięte" in str(cell): style_cmds.append(('TEXTCOLOR', (c_idx, r_idx), (c_idx, r_idx), colors.gray))
+            
+    table.setStyle(TableStyle(style_cmds))
+    elements.append(table)
     doc.build(elements)
     buffer.seek(0)
     return buffer

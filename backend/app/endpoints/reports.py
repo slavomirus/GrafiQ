@@ -95,6 +95,7 @@ async def get_hours_report(
                         "start_time": start_str,
                         "end_time": end_str,
                         "hours": duration,
+                        "shift_name": s.get("shift_name", "")
                     })
 
         return report_data
@@ -179,9 +180,19 @@ async def get_hours_report_pdf_endpoint(
                         "start_time": s_start,
                         "end_time": s_end,
                         "hours": duration,
+                        "shift_name": s.get("shift_name", "")
                     })
 
-        pdf_buffer = generate_hours_report_pdf(report_data, start_date, end_date)
+        franchise_code_for_l4 = current_user.get("franchise_code")
+        sick_leaves = await db.sick_leaves.find({
+            "franchise_code": franchise_code_for_l4,
+            "$or": [
+                {"start_date": {"$lte": datetime.combine(end_date, time.max)}},
+                {"end_date": {"$gte": datetime.combine(start_date, time.min)}}
+            ]
+        }).to_list(length=None) if franchise_code_for_l4 else []
+
+        pdf_buffer = generate_hours_report_pdf(report_data, start_date, end_date, sick_leaves)
         
         filename = f"Raport_Godzin_{start_date}_{end_date}.pdf"
         

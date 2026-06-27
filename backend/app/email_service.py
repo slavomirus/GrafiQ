@@ -102,6 +102,38 @@ Zespół Żabka Grafiki
         logger.error(f"❌ Błąd wysyłania emaila do {email}: {e}")
         raise
 
+async def send_otp_email(email: str, first_name: str, otp: str):
+    """
+    Wyślij email z wygenerowanym jednorazowym hasłem (OTP).
+    """
+    body = f"""Witaj {first_name}!
+
+Otrzymaliśmy prośbę o resetowanie hasła do Twojego konta.
+Twoje jednorazowe hasło tymczasowe to:
+🔐 **{otp}**
+
+Zaloguj się używając tego hasła. Po zalogowaniu zostaniesz automatycznie poproszony o ustalenie nowego hasła do konta.
+
+Jeśli to nie Ty prosiłeś o reset hasła, zignoruj tę wiadomość lub skontaktuj się z administratorem.
+
+Pozdrawiamy,
+Zespół Żabka Grafiki
+"""
+
+    message = MessageSchema(
+        subject="Twoje jednorazowe hasło tymczasowe - Żabka Grafiki",
+        recipients=[email],
+        body=body,
+        subtype="plain"
+    )
+
+    try:
+        await fm.send_message(message)
+        logger.info(f"✅ Email z hasłem jednorazowym OTP wysłany do: {email}")
+    except Exception as e:
+        logger.error(f"❌ Błąd wysyłania emaila OTP do {email}: {e}")
+        raise
+
 async def send_welcome_email(email: str, first_name: str, username: Optional[str] = None,
                              password: Optional[str] = None, user_id: Optional[str] = None):
     """

@@ -188,6 +188,7 @@ class UserBase(MongoDBModel):
     franchise_code: Optional[str] = None
     store_location: Optional[str] = None
     preferences: Optional[UserPreferences] = Field(default_factory=UserPreferences)
+    store_roles: List[str] = Field(default_factory=list)
 
 class UserCreate(UserBase):
     password: str

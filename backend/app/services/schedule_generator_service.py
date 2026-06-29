@@ -47,6 +47,7 @@ class Employee:
     last_name: str
     contract_type: str
     fte_or_target: float
+    store_roles: List[str] = field(default_factory=list)
     
     # Input Constraints
     unavailabilities: List[TimeRange] = field(default_factory=list)
@@ -187,6 +188,7 @@ class ScheduleGenerator:
                 last_name=db_emp.get("last_name", ""),
                 contract_type=contract,
                 fte_or_target=fte_or_target,
+                store_roles=db_emp.get("store_roles", []),
                 preferences=normalized_prefs
             )
 
@@ -478,6 +480,28 @@ class ScheduleGenerator:
             score -= 40.0  # Silna kara jeśli pracował 5+ z ostatnich 6 dni
         elif recent_work_days >= 4:
             score -= 15.0
+
+        # 5. Punktacja za przypisane role (Kasa, Sklep)
+        roles = emp.store_roles or []
+        has_kasa = 'kasa' in roles
+        has_sklep = 'sklep' in roles
+
+        if has_kasa and has_sklep:
+            # Kasa + Sklep: +37.5 do ran/zamknięć, +12.5 do międzyzmian
+            if shift.shift_type in [schemas.ShiftType.MORNING.value, schemas.ShiftType.CLOSING.value]:
+                score += 37.5
+            elif shift.shift_type == schemas.ShiftType.MIDDLE.value:
+                score += 12.5
+        elif has_kasa:
+            # Tylko Kasa: +50 do ran i zamknięć
+            if shift.shift_type in [schemas.ShiftType.MORNING.value, schemas.ShiftType.CLOSING.value]:
+                score += 50.0
+        elif has_sklep:
+            # Tylko Sklep: -50 do ran/zamknięć, +50 do międzyzmian
+            if shift.shift_type in [schemas.ShiftType.MORNING.value, schemas.ShiftType.CLOSING.value]:
+                score -= 50.0
+            elif shift.shift_type == schemas.ShiftType.MIDDLE.value:
+                score += 50.0
 
         return score
 

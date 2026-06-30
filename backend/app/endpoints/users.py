@@ -125,8 +125,10 @@ async def update_user(
     
     # Jeśli zmieniono parametry wpływające na urlop, przelicz go
     if "fte" in update_data or "seniority_years" in update_data or "leave_entitlement" in update_data:
-        fte = update_data.get("fte", user.get("fte", 1.0))
-        seniority = update_data.get("seniority_years", user.get("seniority_years", 0))
+        fte_raw = update_data.get("fte", user.get("fte", 1.0))
+        fte = fte_raw if fte_raw is not None else 1.0
+        seniority_raw = update_data.get("seniority_years", user.get("seniority_years", 0))
+        seniority = seniority_raw if seniority_raw is not None else 0
         manual_entitlement = update_data.get("leave_entitlement")
         
         if manual_entitlement is not None:

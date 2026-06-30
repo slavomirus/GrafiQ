@@ -160,6 +160,19 @@ class StoreOpeningHours(BaseModel):
     sunday: OpeningHoursDay
     holiday: Dict[str, OpeningHoursHoliday] = {}
 
+class DeliveryType(str, Enum):
+    COLD = "chłodnia-mroźnia"
+    DRY = "palety-suche"
+
+class DeliveryTime(str, Enum):
+    MORNING = "ranek"
+    EVENING = "wieczór"
+
+class DeliverySchedule(BaseModel):
+    day_of_week: int = Field(ge=0, le=6, description="0=Poniedziałek, 6=Niedziela")
+    delivery_time: DeliveryTime
+    delivery_type: DeliveryType
+
 class StoreSettingsBase(BaseModel):
     franchise_code: str
     employees_per_morning_shift: int = Field(default=1, ge=1, le=5)
@@ -188,6 +201,11 @@ class StoreSettingsBase(BaseModel):
 
     # Dzień miesiąca (1-28), do którego pracownicy muszą złożyć wniosek urlopowy
     vacation_deadline_day: int = Field(default=20, ge=1, le=28, description="Dzień miesiąca - termin składania wniosków urlopowych")
+    
+    # Dzień miesiąca (1-28) - termin przyjmowania dyspozycji na następny miesiąc
+    availability_deadline_day: int = Field(default=20, ge=1, le=28, description="Dzień miesiąca - termin przyjmowania dyspozycji")
+
+    deliveries: List[DeliverySchedule] = Field(default_factory=list)
 
 class StoreSettingsCreate(StoreSettingsBase):
     pass

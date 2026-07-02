@@ -365,10 +365,10 @@ class UserBase(BaseModel):
     first_name: str
     last_name: str
     preferences: Optional[UserPreferences] = Field(default_factory=UserPreferences)
-    fte: float = Field(default=1.0, ge=0.1, le=1.0, description="Wymiar etatu (np. 1.0, 0.5)")
-    seniority_years: int = Field(default=0, ge=0, description="Staż pracy w latach (do obliczania urlopu)")
+    fte: Optional[float] = Field(default=1.0, ge=0.1, le=1.0, description="Wymiar etatu (np. 1.0, 0.5)")
+    seniority_years: Optional[int] = Field(default=0, ge=0, description="Staż pracy w latach (do obliczania urlopu)")
     leave_entitlement: Optional[int] = Field(default=None, description="Przysługujący urlop (dni). Jeśli null, obliczany automatycznie.")
-    store_roles: List[str] = Field(default_factory=list, description="Role: kasa, sklep")
+    store_roles: Optional[List[str]] = Field(default_factory=list, description="Role: kasa, sklep")
 
 class UserCreateFranchisee(UserBase):
     email: EmailStr

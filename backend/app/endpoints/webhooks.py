@@ -36,7 +36,7 @@ async def revenuecat_webhook(request: Request, db: motor.motor_asyncio.AsyncIOMo
             return {"status": "ok", "message": "Ignored - invalid user ID"}
 
         # Zdarzenia, które aktywują / przedłużają subskrypcję
-        active_events = ["INITIAL_PURCHASE", "RENEWAL", "UNCANCELLATION", "NON_RENEWING_PURCHASE"]
+        active_events = ["INITIAL_PURCHASE", "RENEWAL", "UNCANCELLATION", "NON_RENEWING_PURCHASE", "PRODUCT_CHANGE"]
         
         # Zdarzenia, które dezaktywują / wstrzymują subskrypcję (PAUSE to funkcja Google Play)
         inactive_events = ["CANCELLATION", "EXPIRATION", "BILLING_ISSUE", "PAUSE"]
@@ -49,15 +49,20 @@ async def revenuecat_webhook(request: Request, db: motor.motor_asyncio.AsyncIOMo
             else:
                 expiration_date = datetime.utcnow() + timedelta(days=30) # Default
                 
+            update_data = {
+                "is_subscription_active": True,
+                "isPremium": True,
+                "subscription_valid_until": expiration_date,
+                "subscription_status_reason": event_type
+            }
+            if event.get("product_id"):
+                update_data["subscription_plan"] = event.get("product_id")
+
             await db.users.update_one(
                 {"_id": user_object_id},
-                {"$set": {
-                    "is_subscription_active": True,
-                    "subscription_valid_until": expiration_date,
-                    "subscription_status_reason": event_type
-                }}
+                {"$set": update_data}
             )
-            logger.info(f"Subskrypcja aktywowana dla {app_user_id} do {expiration_date}")
+            logger.info(f"Subskrypcja aktywowana dla {app_user_id} do {expiration_date} (plan: {event.get('product_id')})")
 
         elif event_type in inactive_events:
             # Subskrypcja wygasła, została anulowana lub WSTRZYMANA (PAUSE)
@@ -65,6 +70,7 @@ async def revenuecat_webhook(request: Request, db: motor.motor_asyncio.AsyncIOMo
                 {"_id": user_object_id},
                 {"$set": {
                     "is_subscription_active": False,
+                    "isPremium": False,
                     "subscription_status_reason": event_type
                 }}
             )

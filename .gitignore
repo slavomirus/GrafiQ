@@ -27,3 +27,13 @@ yarn-error.log*
 
 # Docker volumes
 mongo-data/
+
+# Python
+venv/
+backend/venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+

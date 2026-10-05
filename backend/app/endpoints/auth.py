@@ -12,6 +12,7 @@ from .. import models, schemas, security
 from ..email_service import send_verification_code_email, send_otp_email
 from ..dependencies import get_current_user
 from ..config import settings
+from ..limiter import limiter
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -28,12 +29,16 @@ async def register_franchisee(user: schemas.UserCreateFranchisee,
     # Sanityzacja kodu franczyzy (usuwanie spacji)
     clean_franchise_code = user.franchise_code.strip()
 
-    existing_user = await db.users.find_one({"email": user.email})
+    query_conditions = [{"email": user.email}]
+    if user.phone:
+        query_conditions.append({"phone": user.phone})
+        
+    existing_user = await db.users.find_one({"$or": query_conditions})
     if existing_user:
         # Jeśli użytkownik istnieje, ale jest w fazie PENDING i nie zweryfikował maila,
         # uznajemy to za nieudaną wcześniejszą rejestrację i usuwamy stare konto.
         if existing_user.get("status") == models.UserStatus.PENDING.value and not existing_user.get("email_verified"):
-            logger.info(f"Wykryto niezweryfikowane konto PENDING dla {user.email}. Usuwanie i ponowna rejestracja.")
+            logger.info(f"Wykryto niezweryfikowane konto PENDING dla {user.email} lub {user.phone}. Usuwanie i ponowna rejestracja.")
             
             # Sprawdź czy istnieje sklep powiązany z tym niezweryfikowanym użytkownikiem
             existing_store = await db.stores.find_one({"franchise_code": clean_franchise_code})
@@ -43,7 +48,10 @@ async def register_franchisee(user: schemas.UserCreateFranchisee,
             
             await db.users.delete_one({"_id": existing_user["_id"]})
         else:
-            raise HTTPException(status_code=400, detail="Użytkownik o podanym adresie e-mail już istnieje")
+            if existing_user.get("email") == user.email:
+                raise HTTPException(status_code=400, detail="Użytkownik o podanym adresie e-mail już istnieje")
+            if existing_user.get("phone") == user.phone:
+                raise HTTPException(status_code=400, detail="Użytkownik o podanym numerze telefonu już istnieje")
 
     hashed_password = security.get_password_hash(user.password.get_secret_value())
     verification_code = ''.join(secrets.choice('0123456789') for _ in range(6))
@@ -77,8 +85,45 @@ async def register_franchisee(user: schemas.UserCreateFranchisee,
         "agreements": agreements_data
     }
 
+    # Sprawdzenie kodu polecającego przed dodaniem usera
+    referral_code_doc = None
+    if user.referral_code:
+        code_str = user.referral_code.strip()
+        referral_code_doc = await db.referral_codes.find_one({"code": code_str})
+        if not referral_code_doc:
+            raise HTTPException(status_code=400, detail="Nieprawidłowy kod polecający.")
+        if referral_code_doc.get("uses_left", 0) <= 0:
+            raise HTTPException(status_code=400, detail="Ten kod osiągnął maksymalną liczbę użyć.")
+            
+        # Zastosuj bonus dla nowego usera od razu
+        new_user_data["free_access_until"] = now + timedelta(days=90)
+        new_user_data["used_referral_code"] = code_str
+
     result = await db.users.insert_one(new_user_data)
     user_id = str(result.inserted_id)
+    
+    # Aktualizacja właściciela kodu i samego kodu
+    if referral_code_doc:
+        owner = await db.users.find_one({"_id": referral_code_doc["owner_id"]})
+        if owner:
+            owner_free_until = owner.get("free_access_until")
+            if not owner_free_until or owner_free_until < now:
+                new_owner_date = now + timedelta(days=30)
+            else:
+                new_owner_date = owner_free_until + timedelta(days=30)
+                
+            await db.users.update_one(
+                {"_id": owner["_id"]},
+                {"$set": {"free_access_until": new_owner_date}}
+            )
+            
+        await db.referral_codes.update_one(
+            {"_id": referral_code_doc["_id"]},
+            {
+                "$inc": {"uses_left": -1},
+                "$push": {"used_by": result.inserted_id}
+            }
+        )
     
     # Automatyczne utworzenie sklepu dla franczyzobiorcy
     existing_store = await db.stores.find_one({"franchise_code": clean_franchise_code})
@@ -109,7 +154,9 @@ async def register_franchisee(user: schemas.UserCreateFranchisee,
 
 
 @router.post("/token", response_model=schemas.LoginResponse)
-async def login_for_access_token(login_data: schemas.LoginRequest,
+@limiter.limit("5/15minutes")
+async def login_for_access_token(request: Request,
+                                 login_data: schemas.LoginRequest,
                                  db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)):
     login_identifier = login_data.email
     
@@ -179,7 +226,9 @@ async def set_initial_password(
 
 
 @router.post("/forgot-password", response_model=schemas.ForgotPasswordResponse)
+@limiter.limit("5/15minutes")
 async def request_password_reset(
+    request: Request,
     request_data: schemas.ForgotPasswordRequest,
     db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
 ):

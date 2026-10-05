@@ -82,11 +82,11 @@ async def send_push_to_user(
 
         # Próba wysłania nową metodą (v5+), a jak nie to starą, a jak nie to pętlą
         try:
-            # Dla nowszych wersji firebase-admin
-            if hasattr(messaging, 'send_multicast'):
-                response = messaging.send_multicast(message)
-            elif hasattr(messaging, 'send_each_for_multicast'):
+            # Dla nowszych wersji firebase-admin (v6+)
+            if hasattr(messaging, 'send_each_for_multicast'):
                 response = messaging.send_each_for_multicast(message)
+            elif hasattr(messaging, 'send_multicast'):
+                response = messaging.send_multicast(message)
             else:
                 # Fallback dla bardzo starych lub dziwnych wersji - pętla
                 success_count = 0

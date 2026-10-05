@@ -184,6 +184,7 @@ async def accept_schedule_draft(draft_id: str, current_user: dict = Depends(get_
                     "date": datetime.combine(schedule_date, time.min),
                     "start_time": start_time,
                     "end_time": end_time,
+                    "shift_name": shift_name,
                     "assigned_by_id": current_user["_id"],
                     "created_at": datetime.utcnow()
                 })

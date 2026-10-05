@@ -29,21 +29,24 @@ async def create_swap_request(
     requester_oid = ObjectId(requester_id) if not isinstance(requester_id, ObjectId) else requester_id
     target_oid = ObjectId(target_user_id) if not isinstance(target_user_id, ObjectId) else target_user_id
 
-    requester_shift = await db.schedule.find_one({
+    requester_req_date = request.my_date if isinstance(request.my_date, date) else datetime.strptime(str(request.my_date)[:10], "%Y-%m-%d").date()
+    target_req_date = request.target_date if isinstance(request.target_date, date) else datetime.strptime(str(request.target_date)[:10], "%Y-%m-%d").date()
+
+    requester_shift_query = {
         "franchise_code": franchise_code,
         "user_id": requester_oid,
-        "date": datetime.combine(request.my_date, time.min),
-        "shift_name": request.my_shift_name
-    })
+        "date": datetime.combine(requester_req_date, time.min)
+    }
+    requester_shift = await db.schedule.find_one(requester_shift_query)
     if not requester_shift:
         raise HTTPException(status_code=404, detail="Nie znaleziono Twojej zmiany w podanym dniu.")
 
-    target_shift = await db.schedule.find_one({
+    target_shift_query = {
         "franchise_code": franchise_code,
         "user_id": target_oid,
-        "date": datetime.combine(request.target_date, time.min),
-        "shift_name": request.target_shift_name
-    })
+        "date": datetime.combine(target_req_date, time.min)
+    }
+    target_shift = await db.schedule.find_one(target_shift_query)
     if not target_shift:
         raise HTTPException(status_code=404, detail="Nie znaleziono zmiany pracownika, z którym chcesz się wymienić.")
 
@@ -142,7 +145,13 @@ async def respond_to_swap(
             )
             raise HTTPException(status_code=400, detail=f"Wymiana niemożliwa (zmiana warunków): {reason}")
 
-    new_status = schemas.SwapStatus.ACCEPTED.value if action == "accept" else schemas.SwapStatus.REJECTED.value
+    store_settings = await db.storesettings.find_one({"franchise_code": swap["franchise_code"]})
+    require_approval = store_settings.get("require_swap_approval", True) if store_settings else True
+
+    if action == "accept":
+        new_status = schemas.SwapStatus.PENDING_APPROVAL.value if require_approval else schemas.SwapStatus.ACCEPTED.value
+    else:
+        new_status = schemas.SwapStatus.REJECTED.value
     
     await db.shift_swaps.update_one(
         {"_id": oid},
@@ -151,20 +160,35 @@ async def respond_to_swap(
 
     # --- POWIADOMIENIA ---
     responder_name = f"{current_user.get('first_name')} {current_user.get('last_name')}"
-    status_msg = "zaakceptowana" if action == "accept" else "odrzucona"
+    if action == "accept":
+        status_msg = "oczekuje na zatwierdzenie kierownika" if require_approval else "zaakceptowana"
+    else:
+        status_msg = "odrzucona"
     
     await send_push_to_user(
         db,
         swap["requester_id"],
         f"Wymiana {status_msg}",
-        f"{responder_name} {status_msg} Twoją prośbę o wymianę.",
+        f"{responder_name}: wymiana {status_msg}.",
         data={"type": "swap_response", "swap_id": str(oid), "status": new_status}
     )
+
+    if action == "accept" and require_approval:
+        await send_push_to_admins(
+            db,
+            swap["franchise_code"],
+            "Wniosek o wymianę",
+            f"Wymagana akceptacja prywatnej wymiany zmian pomiędzy pracownikami.",
+            data={"type": "swap_approval_needed", "swap_id": str(oid)}
+        )
     # ---------------------
 
     if action == "accept":
-        await execute_swap(db, swap)
-        return {"message": "Wymiana zaakceptowana i przetworzona."}
+        if not require_approval:
+            await execute_swap(db, swap)
+            return {"message": "Wymiana zaakceptowana i przetworzona."}
+        else:
+            return {"message": "Wymiana zaakceptowana. Oczekuje na zatwierdzenie przez kierownika."}
     else:
         return {"message": "Wymiana odrzucona."}
 
@@ -368,12 +392,35 @@ async def take_shift(
     if not is_valid:
         raise HTTPException(status_code=400, detail=f"Wymiana niemożliwa: {reason}")
 
-    await execute_one_way_swap(db, swap, taker_id)
-    
+    store_settings = await db.storesettings.find_one({"franchise_code": swap["franchise_code"]})
+    require_approval = store_settings.get("require_swap_approval", True) if store_settings else True
+
+    if not require_approval:
+        await execute_one_way_swap(db, swap, taker_id)
+        await db.shift_swaps.update_one(
+            {"_id": oid},
+            {"$set": {
+                "status": schemas.SwapStatus.ACCEPTED.value, 
+                "target_user_id": taker_id,
+                "target_date": swap["my_date"],
+                "target_shift_name": swap["my_shift_name"],
+                "updated_at": datetime.utcnow()
+            }}
+        )
+        
+        taker_name = f"{current_user.get('first_name')} {current_user.get('last_name')}"
+        await send_push_to_user(
+            db, swap["requester_id"], "Twoja zmiana z giełdy została przejęta!", 
+            f"{taker_name} przejął Twoją zmianę w dniu {swap['my_date'].date()}.",
+            data={"type": "swap_approved"}
+        )
+        return {"message": "Zgłoszono chęć przejęcia zmiany. Została ona automatycznie zatwierdzona."}
+
+    # Wymagana akceptacja przez franczyzobiorcę
     await db.shift_swaps.update_one(
         {"_id": oid},
         {"$set": {
-            "status": schemas.SwapStatus.ACCEPTED.value, 
+            "status": schemas.SwapStatus.PENDING_APPROVAL.value, 
             "target_user_id": taker_id,
             "target_date": swap["my_date"],
             "target_shift_name": swap["my_shift_name"],
@@ -382,9 +429,81 @@ async def take_shift(
     )
     
     taker_name = f"{current_user.get('first_name')} {current_user.get('last_name')}"
+    
+    # Powiadomienie do wystawiającego
     await send_push_to_user(
-        db, swap["requester_id"], "Ktoś przejął Twoją zmianę!", f"{taker_name} przejmuje Twoją zmianę w dniu {swap['my_date'].date()}.",
-        data={"type": "swap_taken"}
+        db, swap["requester_id"], "Ktoś chce przejąć Twoją zmianę!", 
+        f"{taker_name} chce przejąć Twoją zmianę w dniu {swap['my_date'].date()}. Oczekuje na akceptację szefa.",
+        data={"type": "swap_pending"}
     )
     
-    return {"message": "Zmiana została przypisana do Ciebie."}
+    # Powiadomienie do adminów
+    await send_push_to_admins(
+        db,
+        swap["franchise_code"],
+        "Wniosek z Giełdy Zmian",
+        f"{taker_name} chce przejąć zmianę z giełdy. Wymagana Twoja akceptacja.",
+        data={"type": "swap_approval_needed", "swap_id": str(oid)}
+    )
+    
+    return {"message": "Zgłoszono chęć przejęcia zmiany. Oczekuje na akceptację kierownika."}
+
+async def approve_marketplace_claim(
+    db: motor.motor_asyncio.AsyncIOMotorDatabase,
+    swap_id: str,
+    action: str, # "accepted" or "rejected"
+    admin_user: dict
+) -> schemas.MessageResponse:
+    try:
+        oid = ObjectId(swap_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid ID")
+
+    swap = await db.shift_swaps.find_one({"_id": oid})
+    if not swap:
+        raise HTTPException(status_code=404, detail="Wniosek nie znaleziony.")
+
+    if swap["status"] != schemas.SwapStatus.PENDING_APPROVAL.value:
+        raise HTTPException(status_code=400, detail="Wniosek nie jest w stanie oczekiwania na akceptację.")
+
+    new_status = schemas.SwapStatus.ACCEPTED.value if action == "accepted" else schemas.SwapStatus.AVAILABLE.value
+    # Jeśli odrzucony, wraca na giełdę jako AVAILABLE, czyści target_user_id
+
+    update_doc = {
+        "status": new_status, 
+        "updated_at": datetime.utcnow()
+    }
+    
+    if action == "rejected":
+        update_doc["target_user_id"] = None
+        update_doc["target_date"] = None
+        update_doc["target_shift_name"] = None
+
+    await db.shift_swaps.update_one(
+        {"_id": oid},
+        {"$set": update_doc}
+    )
+
+    status_msg = "zaakceptowany" if action == "accepted" else "odrzucony"
+
+    if action == "accepted":
+        await execute_one_way_swap(db, swap, swap["target_user_id"])
+        
+        # Powiadom target
+        await send_push_to_user(
+            db, swap["target_user_id"], "Przejęcie zmiany zaakceptowane!", "Zarządca zaakceptował Twoje przejęcie zmiany.",
+            data={"type": "swap_approved"}
+        )
+        # Powiadom requestera
+        await send_push_to_user(
+            db, swap["requester_id"], "Przejęcie zmiany zaakceptowane!", "Zarządca zaakceptował przejęcie Twojej zmiany.",
+            data={"type": "swap_approved"}
+        )
+        return {"message": "Wymiana z giełdy została zaakceptowana."}
+    else:
+        # Powiadom target
+        await send_push_to_user(
+            db, swap["target_user_id"], "Przejęcie zmiany odrzucone", "Zarządca odrzucił Twoje przejęcie zmiany. Wróciła na giełdę.",
+            data={"type": "swap_rejected"}
+        )
+        return {"message": "Wniosek z giełdy został odrzucony. Zmiana wróciła na giełdę."}

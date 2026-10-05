@@ -115,21 +115,40 @@ async def get_vacation_deadline(
         raise HTTPException(status_code=400, detail="Użytkownik nie jest przypisany do sklepu")
 
     settings = await db.storesettings.find_one({"franchise_code": franchise_code})
+    
+    now = datetime.utcnow()
+    
+    if settings and settings.get("schedule_type") == "weekly":
+        # Deadline to niedziela obecnego tygodnia
+        days_to_sunday = 6 - now.weekday()
+        deadline_date = now + timedelta(days=days_to_sunday)
+        deadline_date = deadline_date.replace(hour=23, minute=59, second=59)
+        deadline_day = deadline_date.day
+        
+        days_left = (deadline_date.date() - now.date()).days
+        
+        return {
+            "deadline_day": deadline_day,
+            "deadline_date": deadline_date.strftime("%Y-%m-%d"),
+            "days_left": max(0, days_left),
+            "is_overdue": now > deadline_date,
+        }
+
+    # Miesięczny tryb działania (Monthly)
     deadline_day = 20  # domyślna wartość
     if settings:
-        deadline_day = settings.get("vacation_deadline_day", 20)
+        deadline_day = settings.get("availability_deadline_day", settings.get("vacation_deadline_day", 20))
 
-    now = datetime.utcnow()
     # Termin dyspozycji to deadline_day bieżącego miesiąca (na urlopy przyszłego miesiąca)
     # Jeśli już minął deadline w tym miesiącu, pokażemy deadline na przyszły miesiąc
-    current_deadline = datetime(now.year, now.month, min(deadline_day, 28))
+    current_deadline = datetime(now.year, now.month, min(int(deadline_day), 28))
     
-    if now.day > deadline_day:
+    if now.day > int(deadline_day):
         # Następny miesiąc
         if now.month == 12:
-            next_deadline = datetime(now.year + 1, 1, min(deadline_day, 28))
+            next_deadline = datetime(now.year + 1, 1, min(int(deadline_day), 28))
         else:
-            next_deadline = datetime(now.year, now.month + 1, min(deadline_day, 28))
+            next_deadline = datetime(now.year, now.month + 1, min(int(deadline_day), 28))
         deadline_date = next_deadline
     else:
         deadline_date = current_deadline
@@ -137,10 +156,10 @@ async def get_vacation_deadline(
     days_left = (deadline_date - now).days
 
     return {
-        "deadline_day": deadline_day,
+        "deadline_day": int(deadline_day),
         "deadline_date": deadline_date.strftime("%Y-%m-%d"),
         "days_left": max(0, days_left),
-        "is_overdue": now.day > deadline_day,
+        "is_overdue": now.day > int(deadline_day),
     }
 
 

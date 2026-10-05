@@ -58,12 +58,19 @@ async def lifespan(app: FastAPI):
     logger.info("Aplikacja kończy działanie... Zamykanie połączenia z bazą danych.")
     await db_manager.close_db_connection()
 
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from .limiter import limiter
+
 app = FastAPI(
     title="Schedule Backend",
     description="API do zarządzania grafikami, urlopami i dostępnością",
     version="0.1.0",
     lifespan=lifespan
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Konfiguracja CORS
 origins = ["*"]
@@ -75,6 +82,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from .middleware import NoSQLInjectionMiddleware
+app.add_middleware(NoSQLInjectionMiddleware)
 
 # --- Montowanie plików statycznych (EULA/RODO) ---
 static_dir = os.path.join(os.path.dirname(__file__), "static")

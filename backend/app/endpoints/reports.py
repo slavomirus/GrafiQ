@@ -75,12 +75,25 @@ async def get_hours_report(
             user_info = user_dict.get(s["user_id"])
             if user_info:
                 # Use parse_time helper for robustness
-                start_time = parse_time(s['start_time'])
-                end_time = parse_time(s['end_time'])
+                start_time = parse_time(s.get('start_time'))
+                end_time = parse_time(s.get('end_time'))
                 
-                if start_time and end_time:
-                    start = datetime.combine(s['date'], start_time)
-                    end = datetime.combine(s['date'], end_time)
+                raw_d = s.get('date')
+                if isinstance(raw_d, datetime):
+                    s_date = raw_d.date()
+                elif isinstance(raw_d, date):
+                    s_date = raw_d
+                elif isinstance(raw_d, str):
+                    try: s_date = datetime.strptime(raw_d[:10], '%Y-%m-%d').date()
+                    except: s_date = None
+                else:
+                    s_date = None
+
+                if start_time and end_time and s_date:
+                    start = datetime.combine(s_date, start_time)
+                    end = datetime.combine(s_date, end_time)
+                    if end < start:
+                        end += timedelta(days=1)
                     duration = (end - start).total_seconds() / 3600
 
                     # Konwersja czasu na string dla Pydantic model (zgodnie ze schematem)
@@ -91,10 +104,10 @@ async def get_hours_report(
                         "user_id": str(s['user_id']),
                         "first_name": user_info.get("first_name", ""),
                         "last_name": user_info.get("last_name", ""),
-                        "date": s['date'],
+                        "date": datetime.combine(s_date, time.min),
                         "start_time": start_str,
                         "end_time": end_str,
-                        "hours": duration,
+                        "hours": round(duration, 2),
                         "shift_name": s.get("shift_name", "")
                     })
 
@@ -164,12 +177,25 @@ async def get_hours_report_pdf_endpoint(
             user_info = user_dict.get(s["user_id"])
             if user_info:
                 # Use helper function to parse time securely (handles HH:MM and HH:MM:SS)
-                s_start = parse_time(s['start_time'])
-                s_end = parse_time(s['end_time'])
+                s_start = parse_time(s.get('start_time'))
+                s_end = parse_time(s.get('end_time'))
                 
-                if s_start and s_end:
-                    start_dt = datetime.combine(s['date'], s_start)
-                    end_dt = datetime.combine(s['date'], s_end)
+                raw_d = s.get('date')
+                if isinstance(raw_d, datetime):
+                    s_date = raw_d.date()
+                elif isinstance(raw_d, date):
+                    s_date = raw_d
+                elif isinstance(raw_d, str):
+                    try: s_date = datetime.strptime(raw_d[:10], '%Y-%m-%d').date()
+                    except: s_date = None
+                else:
+                    s_date = None
+
+                if s_start and s_end and s_date:
+                    start_dt = datetime.combine(s_date, s_start)
+                    end_dt = datetime.combine(s_date, s_end)
+                    if end_dt < start_dt:
+                        end_dt += timedelta(days=1)
                     duration = (end_dt - start_dt).total_seconds() / 3600
 
                     report_data.append({

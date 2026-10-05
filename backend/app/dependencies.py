@@ -136,9 +136,13 @@ async def get_current_active_user(
 
         if franchisee:
             free_access_until = franchisee.get("free_access_until")
-            is_subscription_active = franchisee.get("is_subscription_active", False)
+            subscription_valid_until = franchisee.get("subscription_valid_until")
+            is_premium = franchisee.get("is_subscription_active", False) or franchisee.get("isPremium", False)
+            
+            has_free_access = free_access_until and free_access_until > datetime.utcnow()
+            has_valid_subscription = is_premium and subscription_valid_until and subscription_valid_until > datetime.utcnow()
 
-            is_access_valid = True # has_free_access or is_subscription_active
+            is_access_valid = has_free_access or has_valid_subscription
 
             if not is_access_valid:
                 if role == models.UserRole.FRANCHISEE.value:

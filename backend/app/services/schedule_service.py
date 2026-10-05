@@ -8,11 +8,24 @@ from fastapi import HTTPException, status
 import motor.motor_asyncio
 from typing import List, Dict, Optional, Any, Tuple
 import base64
-from .. import schemas
+from .. import models, schemas
 import json
 import calendar
 import uuid
 from .validator_service import ScheduleValidator
+
+# Ustawowe niedziele handlowe w Polsce (2024 - 2026)
+STATUTORY_COMMERCIAL_SUNDAYS = {
+    # 2024
+    date(2024, 1, 28), date(2024, 3, 24), date(2024, 4, 28), 
+    date(2024, 6, 30), date(2024, 8, 25), date(2024, 12, 15), date(2024, 12, 22),
+    # 2025
+    date(2025, 1, 26), date(2025, 4, 13), date(2025, 4, 27),
+    date(2025, 6, 29), date(2025, 8, 31), date(2025, 12, 14), date(2025, 12, 21),
+    # 2026
+    date(2026, 1, 25), date(2026, 3, 29), date(2026, 4, 26),
+    date(2026, 6, 28), date(2026, 8, 30), date(2026, 12, 13), date(2026, 12, 20),
+}
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +80,7 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
     date_str = date_obj.strftime("%Y-%m-%d")
     s_type = shift_type.lower()
     if s_type == "mid": s_type = "middle"
+    if s_type == "m": s_type = "middle"
 
     # Logika dla dni specjalnych (święta) i niedziel
     special_day = False
@@ -81,10 +95,18 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
         close_time_str = holiday_info.get("close_time")
         special_day = True
     elif date_obj.weekday() == 6: # Niedziela
-        sunday_settings = opening_hours.get("sunday", {})
-        open_time_str = sunday_settings.get("from", "09:00")
-        close_time_str = sunday_settings.get("to", "21:00")
-        special_day = True
+        is_commercial = opening_hours.get("is_commercial_sunday", False)
+        # Traktuj jako handlową tylko jeśli opcja włączona ORAZ data to ustawowa niedziela handlowa
+        if is_commercial and date_obj in STATUTORY_COMMERCIAL_SUNDAYS:
+            # Jeśli niedziela handlowa, traktuj jak zwykły dzień (korzystaj z godzin weekday)
+            weekday_settings = opening_hours.get("weekday", {})
+            open_time_str = weekday_settings.get("from", "06:00")
+            close_time_str = weekday_settings.get("to", "23:00")
+        else:
+            sunday_settings = opening_hours.get("sunday", {})
+            open_time_str = sunday_settings.get("from", "09:00")
+            close_time_str = sunday_settings.get("to", "21:00")
+            special_day = True
 
     if special_day:
         if isinstance(open_time_str, time): open_time_str = open_time_str.strftime("%H:%M")
@@ -106,10 +128,17 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
             return (open_time_str, mid_time_str)
         elif s_type == "closing":
             return (mid_time_str, close_time_str)
-        else: # Dla "middle" lub innych nieobsługiwanych, zwróć cały zakres
+        elif s_type == "middle":
+            # Dla niedzieli niehandlowej/świąt zmiana M jest bezpiecznie wyśrodkowana i wykrojona wewnątrz godzin otwarcia (nie "całka")
+            mid_span_hours = min(8.0, max(6.0, duration_total - 4.0)) if duration_total > 8.0 else max(4.0, duration_total * 0.6)
+            half_span = timedelta(hours=mid_span_hours / 2)
+            m_start_dt = max(start_dt, mid_dt - half_span)
+            m_end_dt = min(end_dt, mid_dt + half_span)
+            return (m_start_dt.strftime("%H:%M"), m_end_dt.strftime("%H:%M"))
+        else:
              return (open_time_str, close_time_str)
 
-    # Logika dla standardowych dni roboczych
+    # Logika dla standardowych dni roboczych oraz niedziel handlowych/zwykłej zmiany M
     default_shifts = {
         "morning": ("06:00", "14:30"),
         "middle": ("10:00", "18:00"),

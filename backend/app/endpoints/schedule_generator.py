@@ -14,8 +14,10 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 class ScheduleGenerationRequest(BaseModel):
-    year: int
-    month: int
+    year: int = None
+    month: int = None
+    start_date: str = None
+    end_date: str = None
 
 @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
 async def generate_schedule_endpoint(
@@ -38,7 +40,9 @@ async def generate_schedule_endpoint(
             db=db,
             current_user=current_user,
             year=request.year,
-            month=request.month
+            month=request.month,
+            start_date_str=request.start_date,
+            end_date_str=request.end_date
         )
         
         # Natychmiastowe zwrócenie odpowiedzi

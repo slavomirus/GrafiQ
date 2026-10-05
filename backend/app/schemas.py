@@ -158,6 +158,7 @@ class OpeningHoursHoliday(BaseModel):
 class StoreOpeningHours(BaseModel):
     weekday: OpeningHoursDay
     sunday: OpeningHoursDay
+    is_commercial_sunday: Optional[bool] = False
     holiday: Dict[str, OpeningHoursHoliday] = {}
 
 class DeliveryType(str, Enum):
@@ -169,7 +170,8 @@ class DeliveryTime(str, Enum):
     EVENING = "wieczór"
 
 class DeliverySchedule(BaseModel):
-    day_of_week: int = Field(ge=0, le=6, description="0=Poniedziałek, 6=Niedziela")
+    day_of_week: Optional[int] = Field(default=None, ge=0, le=6, description="0=Poniedziałek, 6=Niedziela (opcjonalnie, wsteczna kompatybilność)")
+    dates: Optional[List[str]] = Field(default_factory=list, description="Tablica dat dostaw w formacie YYYY-MM-DD")
     delivery_time: DeliveryTime
     delivery_type: DeliveryType
 
@@ -181,8 +183,9 @@ class StoreSettingsBase(BaseModel):
     employees_on_promo_change: int = Field(default=2, ge=2, le=5)
     allow_overtime: bool = True
     allow_inter_store_work: bool = False
+    require_swap_approval: bool = True
 
-    franchisee_monthly_hours: int = Field(default=160, ge=0, description="Liczba godzin pracy franczyzobiorcy w miesiącu")
+    franchisee_monthly_hours: Optional[int] = Field(default=None, ge=0, description="Liczba godzin pracy franczyzobiorcy w miesiącu (opcjonalna)")
 
     shift_hours: Dict[str, ShiftHours] = Field(
         default={
@@ -204,6 +207,9 @@ class StoreSettingsBase(BaseModel):
     
     # Dzień miesiąca (1-28) - termin przyjmowania dyspozycji na następny miesiąc
     availability_deadline_day: int = Field(default=20, ge=1, le=28, description="Dzień miesiąca - termin przyjmowania dyspozycji")
+
+    schedule_type: str = Field(default="monthly", description="Typ grafiku: monthly lub weekly")
+    weekly_availability_deadline_day: int = Field(default=3, ge=1, le=7, description="Dzień tygodnia (1=Pon, 7=Niedz) - termin przyjmowania dyspozycji tygodniowych")
 
     deliveries: List[DeliverySchedule] = Field(default_factory=list)
 
@@ -381,6 +387,7 @@ class UserCreateFranchisee(UserBase):
     street: str
     building_number: str
     phone: Optional[str] = None
+    referral_code: Optional[str] = None
     acceptEula: bool
     acceptRodo: bool
 
@@ -713,6 +720,7 @@ class VacationPDFResponse(BaseModel):
 class SwapStatus(str, Enum):
     REQUESTED = "requested"
     AVAILABLE = "available"
+    PENDING_APPROVAL = "pending_approval"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
     CANCELLED = "cancelled"

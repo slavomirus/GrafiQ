@@ -7,7 +7,7 @@ import motor.motor_asyncio
 from ..database import get_db
 from ..dependencies import get_current_active_user, get_current_admin_user
 from .. import models, schemas
-from ..services.shift_swap_service import create_swap_request, respond_to_swap, offer_shift, take_shift
+from ..services.shift_swap_service import create_swap_request, respond_to_swap, offer_shift, take_shift, approve_marketplace_claim
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -137,3 +137,22 @@ async def get_store_swap_history(
             s["requester_name"] = f"{u.get('first_name', '')} {u.get('last_name', '')}"
         
     return swaps
+
+@router.put("/{swap_id}/approve-claim", response_model=schemas.MessageResponse)
+async def approve_claim_endpoint(
+    swap_id: str,
+    response_data: schemas.SwapResponseRequest,
+    current_user: dict = Depends(get_current_admin_user),
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+):
+    """Zatwierdź przejęcie zmiany z Giełdy Zmian przez Admina."""
+    action_map = {
+        "accepted": "accepted",
+        "rejected": "rejected"
+    }
+    
+    action = action_map.get(response_data.response)
+    if not action:
+        raise HTTPException(status_code=400, detail="Invalid response value. Use 'accepted' or 'rejected'.")
+
+    return await approve_marketplace_claim(db, swap_id, action, current_user)

@@ -80,6 +80,7 @@ class DatabaseManager:
             # Indeksy unikalne i wyszukiwania
             await self.db.users.create_index([("email", 1)], unique=True, sparse=True)
             await self.db.users.create_index([("username", 1)], unique=True, sparse=True)
+            await self.db.users.create_index([("phone", 1)], unique=True, sparse=True)
             await self.db.users.create_index([("franchise_code", 1)])
             await self.db.stores.create_index([("franchise_code", 1)], unique=True)
             await self.db.storesettings.create_index([("franchise_code", 1)], unique=True)

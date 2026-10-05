@@ -45,9 +45,16 @@ async def add_employee(
     db: motor.motor_asyncio.AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Tworzy nowego pracownika i wysyła mu dane logowania na e-mail."""
-    existing_user = await db.users.find_one({"email": employee_data.email})
+    query_conditions = [{"email": employee_data.email}]
+    if getattr(employee_data, 'phone', None):
+        query_conditions.append({"phone": employee_data.phone})
+
+    existing_user = await db.users.find_one({"$or": query_conditions})
     if existing_user:
-        raise HTTPException(status_code=400, detail="Użytkownik o podanym adresie e-mail już istnieje")
+        if existing_user.get("email") == employee_data.email:
+            raise HTTPException(status_code=400, detail="Użytkownik o podanym adresie e-mail już istnieje")
+        if existing_user.get("phone") == employee_data.phone:
+            raise HTTPException(status_code=400, detail="Użytkownik o podanym numerze telefonu już istnieje")
 
     contract_type_mapping = {
         "zlecenie": models.ContractType.UZ,

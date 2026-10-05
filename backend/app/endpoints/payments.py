@@ -199,3 +199,72 @@ async def redeem_referral_code(
     )
 
     return {"message": "Kod został pomyślnie zrealizowany. Otrzymujesz 90 dni darmowego dostępu!"}
+
+from pydantic import BaseModel
+
+class ReceiptVerificationRequest(BaseModel):
+    purchaseToken: str
+    productId: str
+    platform: str
+
+from ..services.play_billing import verify_google_play_receipt
+
+@router.post("/verify-receipt")
+async def verify_receipt(
+    request: ReceiptVerificationRequest,
+    current_user: dict = Depends(get_current_active_user),
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+):
+    """
+    Endpoint do walidacji paragonu zakupowego wysłanego przez aplikację mobilną.
+    """
+    user_id = current_user["_id"]
+
+    # 1. Sprawdź, czy paragon nie został już wykorzystany przez innego użytkownika
+    existing_receipt = await db.users.find_one({
+        "purchaseToken": request.purchaseToken,
+        "_id": {"$ne": user_id}
+    })
+    
+    if existing_receipt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Ten paragon został już przypisany do innego konta."
+        )
+
+    if request.platform == 'android':
+        verification = verify_google_play_receipt(request.purchaseToken, request.productId)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Weryfikacja płatności na platformie iOS nie jest jeszcze wspierana."
+        )
+
+    if not verification.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=verification.get("error", "Weryfikacja paragonu nie powiodła się.")
+        )
+        
+    if not verification.get("is_active"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Subskrypcja wygasła lub została anulowana."
+        )
+
+    # Zaktualizuj bazę danych franczyzobiorcy
+    expiry_date = verification.get("expiry_date", datetime.utcnow() + timedelta(days=30))
+    
+    await db.users.update_one(
+        {"_id": user_id},
+        {
+            "$set": {
+                "isPremium": True,
+                "subscription_plan": request.productId,
+                "subscription_valid_until": expiry_date,
+                "purchaseToken": request.purchaseToken
+            }
+        }
+    )
+
+    return {"message": "Sukces, subskrypcja jest aktywna."}

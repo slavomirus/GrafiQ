@@ -21,7 +21,7 @@ FONT_REGISTERED = False
 
 def register_polish_font():
     """Registers a TTF font that supports Polish characters."""
-    global FONT_REGISTERED
+    global FONT_REGISTERED, FONT_NAME, FONT_NAME_BOLD
     if FONT_REGISTERED:
         return
 
@@ -31,47 +31,46 @@ def register_polish_font():
         font_path_bold = os.path.join(base_dir, "static", "fonts", "DejaVuSans-Bold.ttf")
 
         system_fonts_regular = [
+            font_path,
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
             "/Library/Fonts/Arial.ttf",
             "/System/Library/Fonts/Helvetica.ttc",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
         ]
         
         system_fonts_bold = [
+            font_path_bold,
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
             "/Library/Fonts/Arial Bold.ttf",
             "/System/Library/Fonts/Helvetica.ttc", 
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
         ]
 
-        if not os.path.exists(font_path) or not os.path.exists(font_path_bold):
-            logger.warning("Local font files not found. Checking system fonts...")
-            found_reg = next((p for p in system_fonts_regular if os.path.exists(p)), None)
-            found_bold = next((p for p in system_fonts_bold if os.path.exists(p)), None)
-            
-            if found_reg and found_bold:
-                 pdfmetrics.registerFont(TTFont(FONT_NAME, found_reg))
-                 pdfmetrics.registerFont(TTFont(FONT_NAME_BOLD, found_bold))
-            else:
-                try:
-                    pdfmetrics.registerFont(TTFont(FONT_NAME, "Helvetica"))
-                    pdfmetrics.registerFont(TTFont(FONT_NAME_BOLD, "Helvetica-Bold"))
-                except:
-                    pass 
+        found_reg = next((p for p in system_fonts_regular if os.path.exists(p)), None)
+        found_bold = next((p for p in system_fonts_bold if os.path.exists(p)), None)
+        
+        if found_reg and found_bold:
+            try:
+                pdfmetrics.registerFont(TTFont(FONT_NAME, found_reg))
+                pdfmetrics.registerFont(TTFont(FONT_NAME_BOLD, found_bold))
+                logger.info(f"Registered TTF fonts: {found_reg}, {found_bold}")
+            except Exception as fe:
+                logger.warning(f"Error registering TTF font ({fe}), falling back to Helvetica")
+                FONT_NAME = "Helvetica"
+                FONT_NAME_BOLD = "Helvetica-Bold"
         else:
-            pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
-            pdfmetrics.registerFont(TTFont(FONT_NAME_BOLD, font_path_bold))
+            FONT_NAME = "Helvetica"
+            FONT_NAME_BOLD = "Helvetica-Bold"
+            logger.warning("Could not find Polish TTF fonts. Falling back to built-in Helvetica.")
 
         FONT_REGISTERED = True
     except Exception as e:
         logger.error(f"Failed to register font: {e}", exc_info=True)
-        if not FONT_REGISTERED:
-            try:
-                pdfmetrics.registerFont(TTFont(FONT_NAME, "Helvetica"))
-                pdfmetrics.registerFont(TTFont(FONT_NAME_BOLD, "Helvetica-Bold"))
-            except:
-                pass
-            FONT_REGISTERED = True
+        FONT_NAME = "Helvetica"
+        FONT_NAME_BOLD = "Helvetica-Bold"
+        FONT_REGISTERED = True
 
 register_polish_font()
 
@@ -99,8 +98,16 @@ def is_on_sick_leave(user_id: str, check_date: date, sick_leaves: List[dict]) ->
         if str(leave.get("user_id")) != user_id: continue
         start = leave.get("start_date")
         end = leave.get("end_date")
-        if isinstance(start, str): start = datetime.fromisoformat(start)
-        if isinstance(end, str): end = datetime.fromisoformat(end)
+        if isinstance(start, str):
+            try: start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            except: continue
+        if isinstance(end, str):
+            try: end = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            except: continue
+        if isinstance(start, date) and not isinstance(start, datetime):
+            start = datetime.combine(start, time.min)
+        if isinstance(end, date) and not isinstance(end, datetime):
+            end = datetime.combine(end, time.max)
         if isinstance(start, datetime): start = start.replace(hour=0, minute=0, second=0, microsecond=0)
         if isinstance(end, datetime): end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
         if start <= check_dt <= end: return True
@@ -359,8 +366,14 @@ def generate_hours_report_pdf(report_data: List[Dict[str, Any]], start_date: dat
             }
             
         d = entry['date']
-        if isinstance(d, datetime): d = d.date()
-        date_str = d.strftime("%Y-%m-%d")
+        if isinstance(d, datetime):
+            date_str = d.strftime("%Y-%m-%d")
+        elif isinstance(d, date):
+            date_str = d.strftime("%Y-%m-%d")
+        elif isinstance(d, str):
+            date_str = d[:10]
+        else:
+            date_str = str(d)
         
         if date_str not in schedule_by_date:
             schedule_by_date[date_str] = {}

@@ -165,16 +165,17 @@ async def get_current_admin_user(current_user: dict = Depends(get_current_active
         raise HTTPException(status_code=403, detail="Not enough permissions")
     return current_user
 
-# --- NOWA ZALEŻNOŚĆ DLA PDF (Query Param Token) ---
-async def get_current_admin_user_query(
+# --- ZALEŻNOŚCI DLA PDF I POBIERANIA PLIKÓW (Query Param + Header Auth) ---
+async def get_current_user_query(
     token: Optional[str] = Query(None),
     authorization: Optional[str] = Header(None),
     x_franchise_code: Optional[str] = Header(None, alias="X-Franchise-Code"),
+    franchise_code: Optional[str] = Query(None),
     db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
-):
+) -> dict:
     """
-    Alternatywna metoda autentykacji akceptująca token w parametrze URL (dla pobierania plików).
-    Priorytet: Header > Query Param.
+    Alternatywna metoda autentykacji akceptująca token w parametrze URL (?token=...) lub nagłówku Header.
+    Dostępna dla każdego aktywnego użytkownika (pracownik, franczyzobiorca, admin).
     """
     token_to_use = None
     
@@ -190,11 +191,30 @@ async def get_current_admin_user_query(
             headers={"WWW-Authenticate": "Bearer"},
         )
         
+    effective_franchise = x_franchise_code or franchise_code
     # 1. Pobierz usera (dekodowanie tokenu)
-    user = await get_current_user(token=token_to_use, x_franchise_code=x_franchise_code, db=db)
+    user = await get_current_user(token=token_to_use, x_franchise_code=effective_franchise, db=db)
     
-    # 2. Sprawdź czy aktywny (manualne wywołanie, bo Depends nie działa przy bezpośrednim wywołaniu funkcji)
-    user = await get_current_active_user(current_user=user, db=db)
-    
-    # 3. Sprawdź czy admin
+    # 2. Sprawdź czy aktywny
+    return await get_current_active_user(current_user=user, db=db)
+
+
+async def get_current_admin_user_query(
+    token: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+    x_franchise_code: Optional[str] = Header(None, alias="X-Franchise-Code"),
+    franchise_code: Optional[str] = Query(None),
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+) -> dict:
+    """
+    Wymaga uprawnień administratora lub franczyzobiorcy z obsługą tokenu z Header lub Query Param.
+    """
+    user = await get_current_user_query(
+        token=token,
+        authorization=authorization,
+        x_franchise_code=x_franchise_code,
+        franchise_code=franchise_code,
+        db=db
+    )
     return await get_current_admin_user(current_user=user)
+

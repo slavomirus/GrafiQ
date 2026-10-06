@@ -7,7 +7,7 @@ import motor.motor_asyncio
 from bson import ObjectId
 
 from ..database import get_db
-from ..dependencies import get_current_admin_user, get_current_active_user
+from ..dependencies import get_current_admin_user, get_current_active_user, get_current_user_query
 from .. import schemas, models
 from ..services.pdf_service import generate_hours_report_pdf, parse_time
 
@@ -123,7 +123,7 @@ async def get_hours_report_pdf_endpoint(
         start_date: date,
         end_date: date,
         user_id: Optional[str] = None,
-        current_user: dict = Depends(get_current_active_user), # Allow active users (employees can download their own)
+        current_user: dict = Depends(get_current_user_query), # Supports Bearer Header and ?token=...
         db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
 ):
     """
@@ -140,7 +140,8 @@ async def get_hours_report_pdf_endpoint(
             if user_id == "me":
                 target_user_id = current_user["_id"]
             elif user_id:
-                target_user_id = ObjectId(user_id)
+                try: target_user_id = ObjectId(user_id)
+                except: target_user_id = user_id
             else:
                 target_user_id = None # All users
 
@@ -152,17 +153,20 @@ async def get_hours_report_pdf_endpoint(
         }
 
         if target_user_id:
-            query["user_id"] = target_user_id
+            query["user_id"] = {"$in": [ObjectId(str(target_user_id)), str(target_user_id)]}
         else:
             # If no specific user, filter by franchise (for admin/franchisee)
             franchise_code = current_user.get("franchise_code")
             if franchise_code:
                 franchise_users = await db.users.find({
-                    "franchise_code": franchise_code,
+                    "$or": [
+                        {"franchise_code": franchise_code},
+                        {"franchise_codes": franchise_code}
+                    ],
                     "role": {"$in": [models.UserRole.EMPLOYEE.value, models.UserRole.FRANCHISEE.value]}
                 }).to_list(length=None)
                 franchise_user_ids = [user["_id"] for user in franchise_users]
-                query["user_id"] = {"$in": franchise_user_ids}
+                query["user_id"] = {"$in": franchise_user_ids + [str(uid) for uid in franchise_user_ids]}
 
         # Pobranie grafików
         schedules = await db.schedule.find(query).to_list(length=None)

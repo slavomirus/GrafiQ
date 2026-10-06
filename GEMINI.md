@@ -187,8 +187,24 @@ npm run ios
       * Zmodernizowano `POST /availability/monitor/remind`: wysyłka push przez Firebase FCM oraz niezawodny fallback/uzupełnienie mailowe przez nową funkcję `send_availability_reminder_email` w `email_service.py`.
       * W `schemas.py` oznaczono pole `submitted_at` w `Availability` jako `Optional[datetime] = None`.
     * **Frontend (`ScheduleGenerationScreen.js`):**
-      * Naprawiono błąd przesunięcia strefy czasowej (`toISOString()` cofało daty o 1 dzień w tył) poprzez wprowadzenie `formatDateToYMD`.
-      * Naprawiono brakujące style modala (`modalContainer`, `modalContent`, `modalTitle`, `modalButton`, `cancelButton`), które uniemożliwiały poprawne renderowanie panelu monitora.
-      * Całkowicie przebudowano UI modala: dynamiczny nagłówek z badge'em monitorowanego okresu, przycisk odświeżenia, pigułki podsumowujące (Złożono / Brak / Razem), lista pracowników z awatarami i stanem zadeklarowanych dni, spinner ładowania na pojedynczych i masowych przyciskach przypomnienia oraz stan "Wysłano ✓".
+* **2026-10-06 (Sesja 2):**
+  * **Naprawa i modernizacja generatora plików PDF oraz ich podglądu/pobierania:**
+    * **Przyczyna awarii:** Kontenery produkcyjne Render (`python:3.11-slim-bookworm`) nie posiadały zainstalowanych fontów TrueType, a katalog `backend/app/static/fonts/` nie istniał w repozytorium. Błędny fallback do `TTFont("Helvetica")` rzucał `TTFError` / `ValueError` ("Can't map determine family/bold/italic for dejavusans") przy każdej próbie budowy dokumentu ReportLab (HTTP 500).
+    * **Backend (`pdf_service.py` & `Dockerfile`):**
+      * Skonfigurowano i dołączono do repozytorium pliki czcionek TTF (`DejaVuSans.ttf`, `DejaVuSans-Bold.ttf`) w `app/static/fonts/` z pełną obsługą polskich znaków diakrytycznych.
+      * W `backend/Dockerfile` dodano instalację pakietu `fonts-dejavu-core`.
+      * Wprowadzono bezpieczny fallback do standardowych czcionek Type 1 ReportLab (`Helvetica` / `Helvetica-Bold`) w razie braku plików TTF, eliminując ryzyko awarii serwera.
+      * Naprawiono funkcję `is_on_sick_leave` (bezpieczne rzutowanie dat bez `TypeError: 'hour' is an invalid keyword argument for date`).
+      * Zabezpieczono parsowanie dat w `generate_hours_report_pdf` przed `AttributeError: 'str' object has no attribute 'strftime'`.
+    * **Backend (Autoryzacja i Endpointy):**
+      * Wprowadzono uniwersalną zależność `get_current_user_query` w `dependencies.py` (obsługa `?token=...`, `?franchise_code=...` oraz nagłówków Bearer i `X-Franchise-Code`).
+      * W `schedule.py` odblokowano możliwość pobierania opublikowanego grafiku PDF (`/{schedule_id}/pdf` oraz `/month-pdf`) dla pracowników przypisanych do sklepu oraz dodano obsługę `franchise_codes` (multi-store).
+      * W `vacation.py` odblokowano pobieranie wniosku PDF (`/{vacation_id}/pdf`) dla pracownika, który go złożył.
+      * W `reports.py` (`/hours/pdf`) zintegrowano autoryzację query param oraz obsługę `user_id` w formatach `ObjectId` i `str`.
+    * **Frontend Mobilny:**
+      * W `PDFViewerScreen.js` dodano automatyczne wstrzykiwanie `token` i `franchise_code` do adresu URL, walidację statusu HTTP (`res.info().status < 400`) oraz wsparcie pobierania/otwierania na platformach iOS i Android.
+      * W `EditScheduleScreen.js` zastąpiono `Linking.openURL` bezpośrednią, płynną nawigacją do komponentu `PDFViewer`.
+      * W `ScheduleHistoryScreen.js` dodano query token fallback oraz naprawiono nawigację do `EditSchedule`.
 
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
+

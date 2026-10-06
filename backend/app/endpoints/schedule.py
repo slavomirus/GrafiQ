@@ -10,7 +10,7 @@ from datetime import date, time, datetime, timedelta
 import calendar
 
 from ..database import get_db
-from ..dependencies import get_current_admin_user, get_current_user, get_current_active_user, get_current_admin_user_query
+from ..dependencies import get_current_admin_user, get_current_user, get_current_active_user, get_current_admin_user_query, get_current_user_query
 from ..services.schedule_service import (
     publish_schedule_draft, 
     get_employee_schedule, 
@@ -206,7 +206,7 @@ async def get_my_schedule_endpoint(
 async def get_monthly_schedule_pdf_endpoint(
     month: int = Query(..., ge=1, le=12),
     year: int = Query(..., ge=2020),
-    current_user: dict = Depends(get_current_admin_user_query),
+    current_user: dict = Depends(get_current_user_query),
     db: motor.motor_asyncio.AsyncIOMotorDatabase = Depends(get_db)
 ):
     try:
@@ -238,7 +238,10 @@ async def get_monthly_schedule_pdf_endpoint(
         }).to_list(length=None)
         
         all_employees = await db.users.find({
-            "franchise_code": franchise_code,
+            "$or": [
+                {"franchise_code": franchise_code},
+                {"franchise_codes": franchise_code}
+            ],
             "role": {"$in": [models.UserRole.EMPLOYEE.value, models.UserRole.FRANCHISEE.value]}
         }).to_list(length=None)
         
@@ -275,7 +278,7 @@ async def get_monthly_schedule_pdf_endpoint(
 @router.get("/{schedule_id}/pdf")
 async def get_schedule_pdf_endpoint(
     schedule_id: str,
-    current_user: dict = Depends(get_current_admin_user_query),
+    current_user: dict = Depends(get_current_user_query),
     db: motor.motor_asyncio.AsyncIOMotorDatabase = Depends(get_db)
 ):
     try:
@@ -288,24 +291,41 @@ async def get_schedule_pdf_endpoint(
              raise HTTPException(status_code=400, detail="Invalid ID format")
 
         franchise_code = current_user.get("franchise_code")
+        user_franchises = current_user.get("franchise_codes") or []
+        if franchise_code and franchise_code not in user_franchises:
+            user_franchises.append(franchise_code)
         
-        schedule = await db.schedules.find_one({"_id": oid, "franchise_code": franchise_code})
+        # Wyszukaj grafik
+        schedule = await db.schedules.find_one({"_id": oid})
         if not schedule:
-            schedule = await db.schedule_drafts.find_one({"_id": oid, "franchise_code": franchise_code})
+            schedule = await db.schedule_drafts.find_one({"_id": oid})
             
         if not schedule:
             raise HTTPException(status_code=404, detail="Grafik nie znaleziony")
 
-        store_settings = await db.store_settings.find_one({"franchise_code": franchise_code}) or {}
+        sched_franchise = schedule.get("franchise_code")
+        # Weryfikacja dostępu do franczyzy
+        if current_user.get("role") != models.UserRole.ADMIN.value:
+            if sched_franchise and sched_franchise not in user_franchises and sched_franchise != franchise_code:
+                raise HTTPException(status_code=403, detail="Brak uprawnień do tego grafiku")
+
+        # Pracownik widzi tylko opublikowane
+        if current_user.get("role") == models.UserRole.EMPLOYEE.value:
+            if not schedule.get("is_published", False):
+                raise HTTPException(status_code=403, detail="Grafik roboczy jest niedostępny dla pracowników")
+
+        store_settings = await db.store_settings.find_one({"franchise_code": sched_franchise}) or {}
 
         # WZBOGACENIE O GODZINY (Święta i Ustawienia)
-        await enrich_schedule_data(db, franchise_code, schedule)
+        await enrich_schedule_data(db, sched_franchise, schedule)
 
         start_date = schedule.get("start_date")
         end_date = schedule.get("end_date")
         
-        if isinstance(start_date, str): start_date = datetime.fromisoformat(start_date)
-        if isinstance(end_date, str): end_date = datetime.fromisoformat(end_date)
+        if isinstance(start_date, str):
+            start_date = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+        if isinstance(end_date, str):
+            end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
         
         if isinstance(start_date, date) and not isinstance(start_date, datetime):
             start_date = datetime.combine(start_date, time.min)
@@ -313,25 +333,31 @@ async def get_schedule_pdf_endpoint(
             end_date = datetime.combine(end_date, time.max)
 
         sick_leaves = await db.sick_leaves.find({
-            "franchise_code": franchise_code,
+            "franchise_code": sched_franchise,
             "$or": [
-                {"start_date": {"$lte": end_date}, "end_date": {"$gte": start_date}}
+                {"start_date": {"$lte": end_date}},
+                {"end_date": {"$gte": start_date}}
             ]
         }).to_list(length=None)
 
         all_employees = await db.users.find({
-            "franchise_code": franchise_code,
+            "$or": [
+                {"franchise_code": sched_franchise},
+                {"franchise_codes": sched_franchise}
+            ],
             "role": {"$in": [models.UserRole.EMPLOYEE.value, models.UserRole.FRANCHISEE.value]}
         }).to_list(length=None)
 
         pdf_buffer = generate_schedule_pdf(schedule, store_settings, sick_leaves, all_employees)
         
-        filename = f"grafik_{schedule.get('start_date')}_{schedule.get('end_date')}.pdf"
+        s_date_str = start_date.strftime("%Y-%m-%d") if start_date else "start"
+        e_date_str = end_date.strftime("%Y-%m-%d") if end_date else "end"
+        filename = f"grafik_{s_date_str}_{e_date_str}.pdf"
         
         return StreamingResponse(
             pdf_buffer, 
             media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+            headers={"Content-Disposition": f"attachment; filename=\"{filename}\""}
         )
     except HTTPException as he:
         raise he

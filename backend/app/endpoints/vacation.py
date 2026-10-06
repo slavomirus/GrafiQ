@@ -11,7 +11,7 @@ import calendar
 import os
 
 from ..database import get_db
-from ..dependencies import get_current_active_user, get_current_admin_user, get_current_admin_user_query
+from ..dependencies import get_current_active_user, get_current_admin_user, get_current_admin_user_query, get_current_user_query
 from .. import models, schemas
 from ..services.vacation_service import check_vacation_conflict
 from ..services.pdf_service import generate_schedule_pdf, FONT_NAME, FONT_NAME_BOLD
@@ -539,7 +539,7 @@ async def reject_vacation(
 @router.get("/{vacation_id}/pdf")
 async def get_vacation_pdf(
     vacation_id: str,
-    current_user: dict = Depends(get_current_admin_user_query),
+    current_user: dict = Depends(get_current_user_query),
     db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
 ):
     try:
@@ -551,12 +551,29 @@ async def get_vacation_pdf(
         if vacation.get("status") != models.VacationStatus.APPROVED.value:
             raise HTTPException(status_code=403, detail="Można generować PDF tylko dla zaakceptowanych wniosków.")
 
+        # Pracownik może pobrać tylko własny wniosek
+        if current_user.get("role") == models.UserRole.EMPLOYEE.value:
+            if str(vacation.get("user_id")) != str(current_user["_id"]):
+                raise HTTPException(status_code=403, detail="Brak uprawnień do tego wniosku.")
+
         user = await db.users.find_one({"_id": vacation["user_id"]})
+        if not user:
+            raise HTTPException(status_code=404, detail="Użytkownik wniosku nie znaleziony")
         
         pdf_buffer = generate_vacation_request_pdf(user, vacation)
         
         safe_lastname = "".join(c for c in user.get('last_name', 'Employee') if c.isalnum())
-        filename = f"wniosek_urlopowy_{safe_lastname}_{vacation['start_date'].date()}.pdf"
+        v_start = vacation.get('start_date')
+        if isinstance(v_start, datetime):
+            v_start_str = v_start.date().isoformat()
+        elif isinstance(v_start, date):
+            v_start_str = v_start.isoformat()
+        elif isinstance(v_start, str):
+            v_start_str = v_start[:10]
+        else:
+            v_start_str = "urlop"
+
+        filename = f"wniosek_urlopowy_{safe_lastname}_{v_start_str}.pdf"
         
         return StreamingResponse(
             pdf_buffer, 
@@ -566,7 +583,7 @@ async def get_vacation_pdf(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Błąd PDF: {e}")
+        logger.error(f"Błąd PDF: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Błąd generowania PDF")
 
 @router.get("/stats/{user_id}")

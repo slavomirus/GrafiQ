@@ -2,11 +2,12 @@ FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Instalacja narzędzi i certyfikatów
+# Instalacja narzędzi, certyfikatów i czcionek TrueType dla generatora PDF
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     wget \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Pobierz certyfikaty CA dla MongoDB Atlas

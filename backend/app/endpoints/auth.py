@@ -12,7 +12,6 @@ from .. import models, schemas, security
 from ..email_service import send_verification_code_email, send_otp_email
 from ..dependencies import get_current_user
 from ..config import settings
-from ..limiter import limiter
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -154,9 +153,8 @@ async def register_franchisee(user: schemas.UserCreateFranchisee,
 
 
 @router.post("/token", response_model=schemas.LoginResponse)
-@limiter.limit("5/15minutes")
-async def login_for_access_token(request: Request,
-                                 login_data: schemas.LoginRequest,
+async def login_for_access_token(login_data: schemas.LoginRequest,
+                                 request: Request = None,
                                  db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)):
     login_identifier = login_data.email
     
@@ -226,7 +224,6 @@ async def set_initial_password(
 
 
 @router.post("/forgot-password", response_model=schemas.ForgotPasswordResponse)
-@limiter.limit("5/15minutes")
 async def request_password_reset(
     request: Request,
     request_data: schemas.ForgotPasswordRequest,

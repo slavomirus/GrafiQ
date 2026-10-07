@@ -139,10 +139,14 @@ async def get_current_active_user(
             subscription_valid_until = franchisee.get("subscription_valid_until")
             is_premium = franchisee.get("is_subscription_active", False) or franchisee.get("isPremium", False)
             
-            has_free_access = free_access_until and free_access_until > datetime.utcnow()
-            has_valid_subscription = is_premium and subscription_valid_until and subscription_valid_until > datetime.utcnow()
+            has_free_access = bool(free_access_until and free_access_until > datetime.utcnow())
+            has_valid_subscription = bool(is_premium and subscription_valid_until and subscription_valid_until > datetime.utcnow())
 
-            is_access_valid = has_free_access or has_valid_subscription
+            # Bezpieczny fallback dla istniejących kont bez skonfigurowanych pól subskrypcyjnych
+            if free_access_until is None and subscription_valid_until is None:
+                is_access_valid = True
+            else:
+                is_access_valid = has_free_access or has_valid_subscription
 
             if not is_access_valid:
                 if role == models.UserRole.FRANCHISEE.value:

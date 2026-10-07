@@ -121,6 +121,15 @@ System składa się z dwóch niezależnych repozytoriów zintegrowanych przez RE
       : String(rep.replacement_name || rep.replacement || 'Nieznany');
   ```
 
+### ⚠️ 9. SlowAPI Rate Limiter za Reverse Proxy i brak CORS w handlerach wyjątków
+* **Objaw:** Komunikat "Wystąpił nieoczekiwany błąd" przy logowaniu w aplikacji mobilnej, brak możliwości zalogowania się z telefonu lub webu.
+* **Przyczyna:** Dekorator `@limiter.limit("5/15minutes")` na `POST /token` używał `get_remote_address` (`request.client.host`). Za reverse proxy (Render / Cloudflare) wszystkie żądania przychodzą ze współdzielonego IP bramy, blokując logowanie wszystkim użytkownikom po 5 próbach w 15 minut. Dodatkowo standardowy handler `_rate_limit_exceeded_handler` zwracał błąd 429 bez nagłówków CORS (`Access-Control-Allow-Origin`), co w aplikacji mobilnej objawiało się jako błąd sieciowy / "Wystąpił nieoczekiwany błąd".
+* **Naprawa:**
+  * Usunięto rate limiter z krytycznych endpointów autoryzacji (`/token`, `/forgot-password`).
+  * Wdrożono `custom_rate_limit_exceeded_handler` z pełnymi nagłówkami CORS i formatem JSON w `main.py`.
+  * Usunięto problematyczny `NoSQLInjectionMiddleware`, który ingerował w strumień `request.body()`.
+  * W `dependencies.py` dodano bezpieczny fallback dla starych i testowych kont użytkowników (`free_access_until is None and subscription_valid_until is None -> is_access_valid = True`), zapobiegając fałszywym blokadom HTTP 402/403 przy `GET /users/me/profile`.
+
 ---
 
 ## 4. PROCEDURY OPERACYJNE I PRZYDATNE KOMENDY
@@ -205,6 +214,13 @@ npm run ios
       * W `PDFViewerScreen.js` dodano automatyczne wstrzykiwanie `token` i `franchise_code` do adresu URL, walidację statusu HTTP (`res.info().status < 400`) oraz wsparcie pobierania/otwierania na platformach iOS i Android.
       * W `EditScheduleScreen.js` zastąpiono `Linking.openURL` bezpośrednią, płynną nawigacją do komponentu `PDFViewer`.
       * W `ScheduleHistoryScreen.js` dodano query token fallback oraz naprawiono nawigację do `EditSchedule`.
+
+* **2026-10-07:**
+  * **Diagnostyka i naprawa błędu logowania ("Wystąpił nieoczekiwany błąd"):**
+    * **Główna przyczyna:** Dekorator `@limiter.limit("5/15minutes")` na `POST /token` używał `get_remote_address`. Za reverse proxy Rendera wszystkie żądania traktowane były jako pochodzące z jednego IP. Po 5 próbach serwer zwracał HTTP 429 przez domyślny handler SlowAPI bez nagłówków CORS (`Access-Control-Allow-Origin`), co w aplikacji mobilnej Axios maskował jako Network Error i wyświetlał "Wystąpił nieoczekiwany błąd".
+    * **Backend (`auth.py`):** Usunięto `@limiter` z endpointów `/token` oraz `/forgot-password`.
+    * **Backend (`main.py`):** Zastąpiono domyślny handler SlowAPI funkcją `custom_rate_limit_exceeded_handler` z pełnymi nagłówkami CORS i odpowiedzią JSON; usunięto eksperymentalny `NoSQLInjectionMiddleware` psujący strumienie `request.body()`.
+    * **Backend (`dependencies.py`):** W `get_current_active_user` dodano bezpieczny fallback dla istniejących kont bez skonfigurowanych dat subskrypcji (`free_access_until is None and subscription_valid_until is None -> is_access_valid = True`), zapobiegając błędnemu rzucaniu HTTP 402/403 podczas pobierania profilu zaraz po zalogowaniu.
 
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

@@ -268,7 +268,11 @@ async def get_monthly_schedule_pdf_endpoint(
         return StreamingResponse(
             pdf_buffer, 
             media_type="application/pdf",
-            headers={"Content-Disposition": f"inline; filename=\"{filename}\""}
+            headers={
+                "Content-Disposition": f"inline; filename=\"{filename}\"",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
         )
         
     except Exception as e:
@@ -357,7 +361,11 @@ async def get_schedule_pdf_endpoint(
         return StreamingResponse(
             pdf_buffer, 
             media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=\"{filename}\""}
+            headers={
+                "Content-Disposition": f"inline; filename=\"{filename}\"",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
         )
     except HTTPException as he:
         raise he

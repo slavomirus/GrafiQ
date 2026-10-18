@@ -38,8 +38,18 @@ def generate_vacation_request_pdf(user: dict, vacation: dict) -> BytesIO:
     
     c.drawString(2*cm, 22*cm, "Proszę o udzielenie urlopu wypoczynkowego w terminie:")
     
-    start_str = vacation['start_date'].strftime('%Y-%m-%d')
-    end_str = vacation['end_date'].strftime('%Y-%m-%d')
+    start_val = vacation.get('start_date')
+    if isinstance(start_val, (datetime, date)):
+        start_str = start_val.strftime('%Y-%m-%d')
+    else:
+        start_str = str(start_val)[:10]
+
+    end_val = vacation.get('end_date')
+    if isinstance(end_val, (datetime, date)):
+        end_str = end_val.strftime('%Y-%m-%d')
+    else:
+        end_str = str(end_val)[:10]
+
     days = vacation.get('days_requested', 0)
     
     c.setFont(FONT_NAME_BOLD, 12)
@@ -578,7 +588,11 @@ async def get_vacation_pdf(
         return StreamingResponse(
             pdf_buffer, 
             media_type="application/pdf",
-            headers={"Content-Disposition": f"inline; filename=\"{filename}\""}
+            headers={
+                "Content-Disposition": f"inline; filename=\"{filename}\"",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
         )
     except HTTPException:
         raise

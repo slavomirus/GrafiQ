@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time
 from typing import List, Optional
 import logging
 import motor.motor_asyncio
@@ -229,7 +229,11 @@ async def get_hours_report_pdf_endpoint(
         return StreamingResponse(
             pdf_buffer, 
             media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+            headers={
+                "Content-Disposition": f"inline; filename=\"{filename}\"",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
         )
 
     except Exception as e:

@@ -222,5 +222,14 @@ npm run ios
     * **Backend (`main.py`):** Zastąpiono domyślny handler SlowAPI funkcją `custom_rate_limit_exceeded_handler` z pełnymi nagłówkami CORS i odpowiedzią JSON; usunięto eksperymentalny `NoSQLInjectionMiddleware` psujący strumienie `request.body()`.
     * **Backend (`dependencies.py`):** W `get_current_active_user` dodano bezpieczny fallback dla istniejących kont bez skonfigurowanych dat subskrypcji (`free_access_until is None and subscription_valid_until is None -> is_access_valid = True`), zapobiegając błędnemu rzucaniu HTTP 402/403 podczas pobierania profilu zaraz po zalogowaniu.
 
+* **2026-10-18:**
+  * **Naprawa i modernizacja systemu generowania, podglądu i pobierania plików PDF:**
+    * **Backend (`reports.py`):** Naprawiono krytyczny błąd `NameError: name 'time' is not defined` (brakujący import `time` z modułu `datetime` w linii 3 rzucał HTTP 500 przy każdej próbie wygenerowania raportu godzinowego PDF w Dashboardzie i Rozliczeniach).
+    * **Backend (Nagłówki i CORS):** W `reports.py`, `schedule.py` (`/month-pdf`, `/{schedule_id}/pdf`) oraz `vacation.py` ujednolicono nagłówek `Content-Disposition: inline; filename="..."` oraz dodano nagłówki `Access-Control-Allow-Origin: *` i `Access-Control-Expose-Headers: Content-Disposition`.
+    * **Backend (`vacation.py`):** Zabezpieczono parsowanie dat wniosków urlopowych przed typem string bez metody `.strftime`.
+    * **Frontend (`api.js` & `ScheduleScreen.js`):** Dodano metodę `scheduleAPI.getMonthlyPdfUrl(month, year)` oraz zaktualizowano `handleDownloadPDF` w `ScheduleScreen.js`, aby pobierać pełny grafik miesięczny zamiast ograniczać się do pojedynczego tygodniowego ID.
+    * **Frontend (`PDFViewerScreen.js`):** Zrefaktoryzowano mechanizm podglądu na niezawodne pobieranie lokalne do cache przed renderowaniem w `<Pdf source={{ uri: fileUri }} />`, eliminując awarie sieciowe `react-native-pdf` na Androidzie; dodano akcję "Otwórz" (`FileViewer.open`) w aplikacji zewnętrznej oraz czytelny ekran błędów z przyciskiem ponowienia.
+    * **Frontend (`proguard-rules.pro`):** Dodano regułę `-keep class com.ReactNativeBlobUtil.** { *; }` zapobiegającą wycinaniu klas biblioteki sieciowej w release buildzie.
+
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

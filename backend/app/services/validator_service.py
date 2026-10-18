@@ -65,6 +65,7 @@ class ScheduleValidator:
     async def validate_swap(self, swap_request: dict) -> Tuple[bool, Optional[str]]:
         """
         Symuluje wymianę zmian i sprawdza poprawność dla obu stron.
+        Obsługuje również jednostronne przejęcie (gdy target_shift_name to None, 'none' lub '').
         """
         requester_id = swap_request["requester_id"]
         target_user_id = swap_request["target_user_id"]
@@ -73,7 +74,6 @@ class ScheduleValidator:
         # Dane zmiany requestera (którą oddaje)
         date1 = swap_request["my_date"]
         if isinstance(date1, datetime): date1 = date1.date()
-        # Musimy pobrać godziny tej zmiany z bazy
         shift1_doc = await self.db.schedule.find_one({
             "franchise_code": franchise_code,
             "user_id": requester_id,
@@ -82,27 +82,33 @@ class ScheduleValidator:
         })
         if not shift1_doc: return False, "Nie znaleziono zmiany inicjatora."
         
-        # Dane zmiany targeta (którą oddaje)
+        s1_start = self._parse_time(shift1_doc["start_time"])
+        s1_end = self._parse_time(shift1_doc["end_time"])
+
+        target_shift_name = swap_request.get("target_shift_name")
+        # Jednostronne przejęcie (np. Giełda Zmian / Marketplace)
+        if not target_shift_name or target_shift_name in ["none", "None", ""]:
+            valid_tgt, reason_tgt = await self.validate_shift_assignment(
+                target_user_id, date1, s1_start, s1_end, franchise_code
+            )
+            if not valid_tgt:
+                return False, f"Odbiorca: {reason_tgt}"
+            return True, None
+
+        # Wymiana dwustronna (1-na-1)
         date2 = swap_request["target_date"]
         if isinstance(date2, datetime): date2 = date2.date()
         shift2_doc = await self.db.schedule.find_one({
             "franchise_code": franchise_code,
             "user_id": target_user_id,
             "date": datetime.combine(date2, time.min),
-            "shift_name": swap_request["target_shift_name"]
+            "shift_name": target_shift_name
         })
         if not shift2_doc: return False, "Nie znaleziono zmiany odbiorcy."
 
-        # Parsowanie godzin
-        s1_start = self._parse_time(shift1_doc["start_time"])
-        s1_end = self._parse_time(shift1_doc["end_time"])
         s2_start = self._parse_time(shift2_doc["start_time"])
         s2_end = self._parse_time(shift2_doc["end_time"])
 
-        # Symulacja 1: Requester bierze zmianę Targeta (shift2) w dniu date2
-        # Ignorujemy jego obecną zmianę w date1 (bo ją oddaje), ale sprawdzamy date2
-        # Uwaga: Jeśli date1 == date2, to po prostu zamieniają się godzinami w tym samym dniu.
-        
         # Sprawdź dla Requestera (bierze shift2)
         valid_req, reason_req = await self.validate_shift_assignment(
             requester_id, date2, s2_start, s2_end, franchise_code, ignore_shift_id=shift1_doc["_id"]

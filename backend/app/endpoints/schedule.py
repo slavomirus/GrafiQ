@@ -626,9 +626,12 @@ async def respond_to_shift_change_request(
                 "last_name": user["last_name"]
             }
             
+            req_start_str = request["requested_start_time"].strftime("%H:%M") if hasattr(request["requested_start_time"], "strftime") else str(request["requested_start_time"])[:5]
+            req_end_str = request["requested_end_time"].strftime("%H:%M") if hasattr(request["requested_end_time"], "strftime") else str(request["requested_end_time"])[:5]
+
             day_schedule[custom_shift_name] = {
-                "start_time": request["requested_start_time"], 
-                "end_time": request["requested_end_time"],
+                "start_time": req_start_str, 
+                "end_time": req_end_str,
                 "employees": [user_obj]
             }
             
@@ -648,8 +651,8 @@ async def respond_to_shift_change_request(
                 "user_id": request["user_id"],
                 "date": datetime.combine(req_date, time.min),
                 "shift_name": custom_shift_name,
-                "start_time": request["requested_start_time"],
-                "end_time": request["requested_end_time"],
+                "start_time": req_start_str,
+                "end_time": req_end_str,
                 "published_at": datetime.utcnow(),
                 "published_by": current_user.get("email")
             })

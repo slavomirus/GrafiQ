@@ -231,5 +231,14 @@ npm run ios
     * **Frontend (`PDFViewerScreen.js`):** Zrefaktoryzowano mechanizm podglądu na niezawodne pobieranie lokalne do cache przed renderowaniem w `<Pdf source={{ uri: fileUri }} />`, eliminując awarie sieciowe `react-native-pdf` na Androidzie; dodano akcję "Otwórz" (`FileViewer.open`) w aplikacji zewnętrznej oraz czytelny ekran błędów z przyciskiem ponowienia.
     * **Frontend (`proguard-rules.pro`):** Dodano regułę `-keep class com.ReactNativeBlobUtil.** { *; }` zapobiegającą wycinaniu klas biblioteki sieciowej w release buildzie.
 
+* **2026-10-18 (Sesja 2):**
+  * **Kompleksowe testy i naprawa systemu wymiany zmian w opublikowanym grafiku:**
+    * **Backend (`validator_service.py`):** Wykryto i naprawiono błąd blokujący przejmowanie zmian z Giełdy Zmian (`take_shift`). Funkcja `validate_swap` zakładała zawsze wymianę dwustronną (1-na-1) i szukała w bazie zmiany odbiorcy z nazwą `"none"`, co odrzucało każde przejęcie z błędem `"Nie znaleziono zmiany odbiorcy"`. Dodano obsługę jednostronnego przejęcia oferty (Marketplace Takeover), weryfikując wyłącznie możliwość przypisania przejmującego pracownika do danej zmiany (`validate_shift_assignment`).
+    * **Backend (`schedule.py`):** W `respond_to_shift_change_request` sformatowano `start_time` i `end_time` do spójnego formatu `"HH:MM"`, zapobiegając zapisywaniu formatu `"HH:MM:SS"`.
+    * **Kompleksowe testy automatyczne:**
+      * Test 1 (Prywatna wymiana 1-na-1): pomyślna weryfikacja zamiany w kolekcji płaskiej `db.schedule` oraz zagnieżdżonej `db.schedules`.
+      * Test 2 (Giełda Zmian - Marketplace): pomyślna weryfikacja wystawienia oferty, listowania na giełdzie oraz przejęcia zmiany przez innego pracownika z aktualizacją obu kolekcji bazy.
+      * Test 3 (Wniosek o zmianę grafiku +/- 5 dni): pomyślne złożenie wniosku przez pracownika, akceptacja przez franczyzobiorcę i utworzenie dedykowanej zmiany w opublikowanym grafiku.
+
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

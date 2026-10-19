@@ -538,8 +538,10 @@ async def get_employee_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabase, cu
     result_list = []
 
     for schedule in schedules:
-        schedule["id"] = str(schedule["_id"])
-        del schedule["_id"]
+        schedule["_id"] = str(schedule["_id"])
+        schedule["id"] = schedule["_id"]
+        if "status" not in schedule or not schedule["status"]:
+            schedule["status"] = "published"
         
         await enrich_schedule_data(db, franchise_code, schedule)
         

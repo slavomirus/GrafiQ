@@ -403,7 +403,8 @@ async def get_schedule_details_endpoint(
             raise HTTPException(status_code=404, detail="Grafik nie znaleziony")
 
         schedule["_id"] = str(schedule["_id"])
-        if "status" not in schedule:
+        schedule["id"] = schedule["_id"]
+        if "status" not in schedule or not schedule["status"]:
             schedule["status"] = "published" if is_published else "DRAFT"
 
         # WZBOGACENIE O GODZINY (Święta i Ustawienia)

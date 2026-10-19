@@ -552,27 +552,62 @@ class ScheduleDayResponse(BaseModel):
     shifts: Dict[str, ShiftDetailResponse]
 
 class ScheduleResponse(BaseModel):
-    id: PyObjectId = Field(alias="_id", serialization_alias="_id")
+    id: Optional[PyObjectId] = Field(default=None, alias="_id", serialization_alias="_id")
     franchise_code: str
     start_date: date
     end_date: date
     schedule: Dict[str, Any]
-    shifts_by_date: Optional[Dict[str, List[Any]]] = None # Dodano pole dla frontendu
-    status: str
-    created_at: datetime
+    shifts_by_date: Optional[Dict[str, Any]] = None # Dodano pole dla frontendu
+    status: Optional[str] = "published"
+    created_at: Optional[datetime] = None
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def coerce_date(cls, v):
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v.replace("Z", "")).date()
+            except Exception:
+                return date.fromisoformat(v[:10])
+        return v
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def default_status(cls, v):
+        return v or "published"
 
     class Config(MongoConfig):
         pass
 
 class ScheduleDraftResponse(BaseModel):
-    id: PyObjectId = Field(alias="_id", serialization_alias="_id")
+    id: Optional[PyObjectId] = Field(default=None, alias="_id", serialization_alias="_id")
     franchise_code: str
     start_date: date
     end_date: date
     schedule: Dict[str, Any]
     conflicts: Optional[List[str]] = None
-    status: str
-    created_at: datetime
+    shifts_by_date: Optional[Dict[str, Any]] = None
+    status: Optional[str] = "DRAFT"
+    created_at: Optional[datetime] = None
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def coerce_date(cls, v):
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v.replace("Z", "")).date()
+            except Exception:
+                return date.fromisoformat(v[:10])
+        return v
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def default_status(cls, v):
+        return v or "DRAFT"
 
     class Config(MongoConfig):
         pass

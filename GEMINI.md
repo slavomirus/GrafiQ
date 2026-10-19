@@ -240,5 +240,24 @@ npm run ios
       * Test 2 (Giełda Zmian - Marketplace): pomyślna weryfikacja wystawienia oferty, listowania na giełdzie oraz przejęcia zmiany przez innego pracownika z aktualizacją obu kolekcji bazy.
       * Test 3 (Wniosek o zmianę grafiku +/- 5 dni): pomyślne złożenie wniosku przez pracownika, akceptacja przez franczyzobiorcę i utworzenie dedykowanej zmiany w opublikowanym grafiku.
 
+* **2026-10-19:**
+  * **Kompleksowa naprawa kalendarza pracownika, historii grafików i podglądu w panelu pracodawcy:**
+    * **Przyczyny awarii:**
+      1. **Błąd Pydantic v2 `date_from_datetime_inexact` na `end_date`:** Dokumenty grafików w MongoDB miały `end_date` zapisane jako `datetime` z czasem (np. `23:59:59`). Pydantic v2 przy typie `date` rzuca błąd walidacji, co wywoływało HTTP 500 na endpointach `GET /schedule/history`, `GET /schedules`, `GET /schedule/my-schedule` oraz `GET /schedule/{id}`.
+      2. **Brakujące pola `created_at` i `status` w starszych grafikach:** Schematy `ScheduleResponse` i `ScheduleDraftResponse` wymagały tych pól bez wartości domyślnych, co powodowało błąd walidacji Pydantic `Field required` (HTTP 500).
+      3. **Usuwanie klucza `_id`:** W `get_employee_schedule` linia `del schedule["_id"]` usuwała `_id`, co powodowało błędy serializacji w modelach opartych na aliasie `_id`.
+      4. **Błąd "undefined is not function" w kalendarzu Dashboardu:** W `DashboardScreen.js` brakowało walidacji `Array.isArray(shifts)` oraz `Array.isArray(dateShifts)` – przy niepełnych danych zmiany wywołanie `.map()` lub `.find()` rzucało wyjątkiem JS, który był przechwytywany i wyświetlany w miejscu kalendarza jako tekst `"undefined is not a function"`. Dodatkowo `ScheduleCalendar.js` nie posiadał zabezpieczeń przed pustym `schedule` ani wywołaniem `onDayPress`.
+      5. **Błąd podglądu opublikowanego grafiku (`ScheduleListScreen.js`):** Lista przekazywała `item.schedule_id` (pole niezwracane przez backend), przez co ekran edycji otwierał się z `scheduleId: undefined` i rzucał HTTP 400 (`Invalid Schedule ID`).
+    * **Backend (`schemas.py`, `schedule.py`, `schedule_service.py`):**
+      * W `ScheduleResponse` i `ScheduleDraftResponse` dodano `@field_validator("start_date", "end_date", mode="before")` obcinający czas z obiektów `datetime` do czystego `date`.
+      * Pola `status` oraz `created_at` oznaczono jako opcjonalne z domyślnym fallbackiem (`published` dla opublikowanych, `DRAFT` dla wersji roboczych).
+      * W `schedule_service.py` (`get_employee_schedule`) oraz `schedule.py` (`get_schedule_details_endpoint`) zachowano obecność zarówno `_id`, jak i `id`.
+    * **Frontend Mobilny:**
+      * W `ScheduleCalendar.js` dodano rygorystyczne zabezpieczenia: `safeSchedule`, bezpieczną konwersję zmian do stringa (`shift.code || shift.text`), walidację `typeof onDayPress === 'function'`.
+      * W `DashboardScreen.js` dodano tablicę `MONTH_NAMES_PL` i funkcję `formatMonthYearPL` (eliminacja niestabilnego `toLocaleString`), zabezpieczono iterację po `shifts_by_date` i `dateShifts` warunkami `Array.isArray`.
+      * W `ScheduleListScreen.js` naprawiono pobieranie ID: `item.id || item._id || item.schedule_id`.
+      * W `EditScheduleScreen.js` zabezpieczono parametry nawigacji (`route?.params?.scheduleId`), dodano walidację ID przed zapytaniem do API oraz sprawdzanie tablic `shifts`.
+      * W `SchedulePreviewModal.js` oraz `ScheduleHistoryScreen.js` zabezpieczono operacje `.split('|')` opcjonalnym chainingiem i rzutowaniem do stringa.
+
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

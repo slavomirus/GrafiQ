@@ -293,5 +293,20 @@ npm run ios
       * Zweryfikowano działanie na czystym emulatorze Androida – aplikacja uruchamia się w ułamku sekundy, a proces żyje stabilnie bez żadnych błędów.
       * Podbito wersję produkcyjną do `1.5.46` (`versionCode 36`) i pomyślnie wygenerowano nową paczkę `app-release.aab`.
 
+* **2026-10-26:**
+  * **Naprawa blokady zapisu dyspozycji przy obecności starych wpisów (`DyspozycjaScreen.js`):**
+    * **Objaw:** Komunikat "Nie mozna zapisac dyspozycji na dzien 2026-05-01 Nie mozesz dodawać dyspozycji na minione dni" przy próbie oddania dyspozycji na listopad.
+    * **Przyczyna:** Stan `selectedDays` przechowywał całą historię dyspozycji pracownika pobraną z bazy (w tym z maja 2026). Funkcja `handleSync` walidowała wszystkie klucze `selectedDays` pod kątem `isSubmissionAllowed(dateStr)`, przez co zsynchronizowana dawno historia blokowała zapis nowych dyspozycji.
+    * **Rozwiązanie:** W `handleSync` filtrowane są wyłącznie nieobsłużone wpisy (`unsyncedEntries = Object.entries(selectedDays).filter(([_, data]) => data && data.synced === false)`). Walidacji i wysyłce podlegają tylko nowo dodane/zmodyfikowane dni, eliminując fałszywą blokadę.
+  * **Wyjaśnienie i ujednolicenie prezentacji zmian niestandardowych `custom_*`:**
+    * **Geneza `custom_f3a8`:** Generowane w `schedule.py:621` przy akceptacji przez franczyzobiorcę wniosku pracownika o zmianę grafiku (+/- 5 dni) z niestandardowymi godzinami (np. 08:00-16:30).
+    * **Obsługa w UI:** W `DashboardScreen.js`, `ScheduleScreen.js` oraz `EditScheduleScreen.js` dodano mapowanie nazw zmian zaczynających się od `custom_` na czytelną etykietę `'Indywidualna'` / `'Własna'`, kod `'W'` oraz spójny kolor wizualny na siatce dni.
+  * **Nowoczesny podgląd wygenerowanego grafiku i obsługa klawiatury (`EditScheduleScreen.js` & `ScheduleGenerationScreen.js`):**
+    * **Podgląd wygenerowanego grafiku:** W `ScheduleGenerationScreen.js` proces generowania po zakończeniu natychmiast przekierowuje do `EditScheduleScreen` (zamiast starego `SchedulePreviewModal`), dając franczyzobiorcy pełny, nowoczesny kolorowy kalendarz z filtrami pracowników.
+    * **Pasek powrotu i publikacja:** W `EditScheduleScreen.js` dodano górny pasek z czytelnym przyciskiem `‹ Wróć` (swobodne wyjście z podglądu w dowolnym momencie) oraz dedykowany przycisk `Opublikuj Grafik` (`handlePublishSchedule`).
+    * **Zapobieganie zasłanianiu przez klawiaturę (`KeyboardAvoidingView`):** W `DayEditModal` opakowano zawartość w `KeyboardAvoidingView` i przewijalny `ScrollView` (`keyboardShouldPersistTaps="handled"`). Wpisywanie godzin niestandardowej zmiany płynnie przesuwa pola ponad klawiaturę.
+    * **Opcja Własna (W):** W selektorze typów zmian dodano opcję `Własna (W)`, która nie nadpisuje ręcznie wpisanych godzin predefiniowanymi przedziałami.
+  * **Wydanie wersji 1.5.47 (versionCode 37):** Pomyślna kompilacja `app-release.aab`.
+
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

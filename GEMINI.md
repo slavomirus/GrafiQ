@@ -259,5 +259,19 @@ npm run ios
       * W `EditScheduleScreen.js` zabezpieczono parametry nawigacji (`route?.params?.scheduleId`), dodano walidację ID przed zapytaniem do API oraz sprawdzanie tablic `shifts`.
       * W `SchedulePreviewModal.js` oraz `ScheduleHistoryScreen.js` zabezpieczono operacje `.split('|')` opcjonalnym chainingiem i rzutowaniem do stringa.
 
+* **2026-10-25:**
+  * **Elastyczny termin składania dyspozycji i naprawa segmentu w panelu franczyzobiorcy:**
+    * **Przyczyny problemu:**
+      1. **Błąd UI w polach wpisywania terminu dyspozycji:** W `StoreSettingsScreen.js` oraz `StoreSettingsComponent.js` pole `availability_deadline_day` miało przypisane `value={String(settings.availability_deadline_day || 20)}`. Przy próbie edycji i wyczyszczenia pola string stawał się pusty (`""`), co ewaluowało się do `20` i uniemożliwiało wpisanie innej wartości (analogiczny problem jak wcześniej przy `franchisee_monthly_hours`).
+      2. **Brak uprawnień pracowników do odczytu ustawień sklepu (`GET /settings/store` -> HTTP 403):** Endpoint wymagał uprawnień administracyjnych (`get_current_admin_user`). Przy wejściu pracownika na ekran dyspozycji (`DyspozycjaScreen.js`) zapytanie o ustawienia sklepu kończyło się błędem 403, przez co aplikacja mobilna zawsze wpadała w fallback z twardo zakodowanym 20. dniem miesiąca.
+      3. **Ograniczenie walidacji Pydantic `le=28`:** W `schemas.py` pola `availability_deadline_day` i `vacation_deadline_day` miały narzucony limit `le=28`, uniemożliwiając ustawienie terminu na dni 29–31.
+    * **Backend (`settings.py`, `schemas.py`, `vacation.py`):**
+      * W `settings.py` zmieniono zależność w `GET /settings/store` na `get_current_active_user`, umożliwiając wszystkim pracownikom sklepu odczytanie godzin otwarcia i terminu dyspozycji (podczas gdy `POST /settings/store` nadal wymaga `get_current_admin_user`).
+      * W `schemas.py` zwiększono dopuszczalny zakres dni w `StoreSettingsBase` do `ge=1, le=31`.
+      * W `vacation.py` (`get_vacation_deadline`) zastosowano dynamiczne wyznaczanie ostatniego dnia miesiąca przez `calendar.monthrange` zamiast sztywnego obcinania do 28.
+    * **Frontend Mobilny (`StoreSettingsScreen.js`, `StoreSettingsComponent.js`, `DyspozycjaScreen.js`):**
+      * W formularzach ustawień sklepu naprawiono `value` pola TextInput na `settings.availability_deadline_day !== undefined && settings.availability_deadline_day !== null ? String(settings.availability_deadline_day) : ''` z placeholderem `"np. 20"`, co pozwala na swobodne czyszczenie i wpisywanie dowolnego dnia (1-31).
+      * W `DyspozycjaScreen.js` zaktualizowano ładowanie ustawień sklepu, wyłączono blokadę czasową dla ról franczyzobiorcy i administratora, dodano walidację przed minionymi dniami oraz wprowadzono czytelny badge informacyjny o aktualnym terminie składania dyspozycji.
+
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

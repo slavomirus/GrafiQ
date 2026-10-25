@@ -9,7 +9,7 @@ from typing import List, Union
 from datetime import datetime
 
 from ..database import get_db
-from ..dependencies import get_current_admin_user
+from ..dependencies import get_current_admin_user, get_current_active_user
 from .. import schemas
 
 router = APIRouter()
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 @router.get("/store", response_model=schemas.StoreSettings)
 async def get_store_settings(
-    current_user: dict = Depends(get_current_admin_user),
+    current_user: dict = Depends(get_current_active_user),
     db: motor.motor_asyncio.AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Pobiera ustawienia dla sklepu franczyzobiorcy lub zwraca domyślne."""

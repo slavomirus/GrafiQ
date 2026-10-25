@@ -202,11 +202,11 @@ class StoreSettingsBase(BaseModel):
         )
     )
 
-    # Dzień miesiąca (1-28), do którego pracownicy muszą złożyć wniosek urlopowy
-    vacation_deadline_day: int = Field(default=20, ge=1, le=28, description="Dzień miesiąca - termin składania wniosków urlopowych")
+    # Dzień miesiąca (1-31), do którego pracownicy muszą złożyć wniosek urlopowy
+    vacation_deadline_day: int = Field(default=20, ge=1, le=31, description="Dzień miesiąca - termin składania wniosków urlopowych")
     
-    # Dzień miesiąca (1-28) - termin przyjmowania dyspozycji na następny miesiąc
-    availability_deadline_day: int = Field(default=20, ge=1, le=28, description="Dzień miesiąca - termin przyjmowania dyspozycji")
+    # Dzień miesiąca (1-31) - termin przyjmowania dyspozycji na następny miesiąc
+    availability_deadline_day: int = Field(default=20, ge=1, le=31, description="Dzień miesiąca - termin przyjmowania dyspozycji")
 
     schedule_type: str = Field(default="monthly", description="Typ grafiku: monthly lub weekly")
     weekly_availability_deadline_day: int = Field(default=3, ge=1, le=7, description="Dzień tygodnia (1=Pon, 7=Niedz) - termin przyjmowania dyspozycji tygodniowych")

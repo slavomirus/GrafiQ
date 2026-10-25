@@ -151,19 +151,23 @@ async def get_vacation_deadline(
 
     # Termin dyspozycji to deadline_day bieżącego miesiąca (na urlopy przyszłego miesiąca)
     # Jeśli już minął deadline w tym miesiącu, pokażemy deadline na przyszły miesiąc
-    current_deadline = datetime(now.year, now.month, min(int(deadline_day), 28))
+    last_day_curr = calendar.monthrange(now.year, now.month)[1]
+    current_deadline = datetime(now.year, now.month, min(int(deadline_day), last_day_curr), 23, 59, 59)
     
-    if now.day > int(deadline_day):
+    if now > current_deadline:
         # Następny miesiąc
         if now.month == 12:
-            next_deadline = datetime(now.year + 1, 1, min(int(deadline_day), 28))
+            next_year = now.year + 1
+            next_month = 1
         else:
-            next_deadline = datetime(now.year, now.month + 1, min(int(deadline_day), 28))
-        deadline_date = next_deadline
+            next_year = now.year
+            next_month = now.month + 1
+        last_day_next = calendar.monthrange(next_year, next_month)[1]
+        deadline_date = datetime(next_year, next_month, min(int(deadline_day), last_day_next), 23, 59, 59)
     else:
         deadline_date = current_deadline
 
-    days_left = (deadline_date - now).days
+    days_left = (deadline_date.date() - now.date()).days
 
     return {
         "deadline_day": int(deadline_day),

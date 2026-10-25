@@ -273,5 +273,17 @@ npm run ios
       * W formularzach ustawień sklepu naprawiono `value` pola TextInput na `settings.availability_deadline_day !== undefined && settings.availability_deadline_day !== null ? String(settings.availability_deadline_day) : ''` z placeholderem `"np. 20"`, co pozwala na swobodne czyszczenie i wpisywanie dowolnego dnia (1-31).
       * W `DyspozycjaScreen.js` zaktualizowano ładowanie ustawień sklepu, wyłączono blokadę czasową dla ról franczyzobiorcy i administratora, dodano walidację przed minionymi dniami oraz wprowadzono czytelny badge informacyjny o aktualnym terminie składania dyspozycji.
 
+  * **Kolorowy Kalendarz Grafiku Franczyzobiorcy z Multi-Selectem Pracowników (`EditScheduleScreen.js` & `ScheduleHistoryScreen.js`):**
+    * **Potrzeba biznesowa:** Dotychczas franczyzobiorca w historii grafików i podglądzie miał wyłącznie widok tabelaryczny (listę). Chciał mieć możliwość wyświetlenia widoku kalendarza (identycznego jak w panelu pracownika), z filtrowaniem po pracownikach (gdzie pracownicy mogą być wybierani wielokrotnie - multi-select) oraz z kolorystycznym rozróżnieniem pracowników na siatce dni (np. Pracownik A – czerwony, Pracownik B – niebieski), co znacząco poprawia czytelność obsady sklepu.
+    * **Frontend Mobilny (`EditScheduleScreen.js`):**
+      * Zaimplementowano paletę 12 nasyconych, kontrastowych barw (`EMPLOYEE_PALETTE`).
+      * Wprowadzono filtry pracowników z obsługą wielokrotnego wyboru (`selectedEmployeeIds` w strukturze `Set`), chipami z inicjałami, liczbą przypisanych zmian w grafiku oraz szybkimi akcjami "Zaznacz wszystkich" i "Wyczyść".
+      * Zbudowano dedykowany komponent `FranchiseeScheduleCalendar` wyświetlający siatkę miesiąca z kolorowymi pillami zmian wybranych pracowników (`● JK: R`, `● AN: Z`), badge'em łącznej liczby zaplanowanych zmian oraz wskaźnikiem `+X więcej` przy większej liczbie zmian w danym dniu.
+      * Dodano interaktywny modal szczegółów i edycji dnia (`DayEditModal`) otwierany po tapnięciu w dowolny dzień kalendarza z kolorowymi awatarami, etykietami godzinowymi i opcją modyfikacji obsady.
+      * Zachowano przełącznik widoków: domyślny `[ 📅 Kalendarz ]` oraz `[ 📋 Tabela (Lista) ]`.
+    * **Frontend Mobilny (`ScheduleHistoryScreen.js`):**
+      * Ujednolicono wejście do grafiku: zarówno kliknięcie karty grafiku, jak i przycisku akcji "Podgląd / Edytuj" prowadzi bezpośrednio do `EditScheduleScreen`.
+      * Usunięto przestarzały, martwy kod modalowy oraz wyeliminowano ostrzeżenia lintera ESLint.
+
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

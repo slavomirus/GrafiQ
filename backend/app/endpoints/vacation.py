@@ -14,61 +14,10 @@ from ..database import get_db
 from ..dependencies import get_current_active_user, get_current_admin_user, get_current_admin_user_query, get_current_user_query
 from .. import models, schemas
 from ..services.vacation_service import check_vacation_conflict
-from ..services.pdf_service import generate_schedule_pdf, FONT_NAME, FONT_NAME_BOLD
+from ..services.pdf_service import generate_vacation_request_pdf, FONT_NAME, FONT_NAME_BOLD
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import cm
-
-def generate_vacation_request_pdf(user: dict, vacation: dict) -> BytesIO:
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    
-    c.setFont(FONT_NAME_BOLD, 16)
-    c.drawString(2*cm, 27*cm, "WNIOSEK O URLOP WYPOCZYNKOWY")
-    
-    c.setFont(FONT_NAME, 12)
-    c.drawString(14*cm, 28*cm, f"Data: {datetime.now().strftime('%Y-%m-%d')}")
-    
-    c.drawString(2*cm, 25*cm, f"Pracownik: {user.get('first_name')} {user.get('last_name')}")
-    c.drawString(2*cm, 24.5*cm, f"Stanowisko: {user.get('role', 'Pracownik')}")
-    
-    c.drawString(2*cm, 22*cm, "Proszę o udzielenie urlopu wypoczynkowego w terminie:")
-    
-    start_val = vacation.get('start_date')
-    if isinstance(start_val, (datetime, date)):
-        start_str = start_val.strftime('%Y-%m-%d')
-    else:
-        start_str = str(start_val)[:10]
-
-    end_val = vacation.get('end_date')
-    if isinstance(end_val, (datetime, date)):
-        end_str = end_val.strftime('%Y-%m-%d')
-    else:
-        end_str = str(end_val)[:10]
-
-    days = vacation.get('days_requested', 0)
-    
-    c.setFont(FONT_NAME_BOLD, 12)
-    c.drawString(2*cm, 21*cm, f"Od: {start_str}   Do: {end_str}")
-    c.drawString(2*cm, 20.5*cm, f"Liczba dni roboczych: {days}")
-    
-    if vacation.get('reason'):
-        c.setFont(FONT_NAME, 12)
-        c.drawString(2*cm, 19.5*cm, f"Uzasadnienie: {vacation['reason']}")
-    
-    c.line(2*cm, 15*cm, 8*cm, 15*cm)
-    c.drawString(2*cm, 14.5*cm, "Podpis pracownika")
-    
-    c.line(12*cm, 15*cm, 18*cm, 15*cm)
-    c.drawString(12*cm, 14.5*cm, "Podpis pracodawcy")
-    
-    c.save()
-    buffer.seek(0)
-    return buffer
 
 async def populate_user_details(db, vacations, franchise_code):
     users = await db.users.find({"franchise_code": franchise_code}).to_list(length=None)
@@ -562,9 +511,6 @@ async def get_vacation_pdf(
         if not vacation:
             raise HTTPException(status_code=404, detail="Wniosek nie znaleziony")
             
-        if vacation.get("status") != models.VacationStatus.APPROVED.value:
-            raise HTTPException(status_code=403, detail="Można generować PDF tylko dla zaakceptowanych wniosków.")
-
         # Pracownik może pobrać tylko własny wniosek
         if current_user.get("role") == models.UserRole.EMPLOYEE.value:
             if str(vacation.get("user_id")) != str(current_user["_id"]):

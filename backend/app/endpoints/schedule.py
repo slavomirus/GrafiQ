@@ -228,7 +228,18 @@ async def get_monthly_schedule_pdf_endpoint(
             sched_content = sched.get("schedule", {})
             merged_schedule_content.update(sched_content)
             
-        store_settings = await db.store_settings.find_one({"franchise_code": franchise_code}) or {}
+        # Jeśli brak opublikowanego grafiku, a użytkownik to pracodawca, sprawdź wersje robocze (drafts)
+        if not merged_schedule_content and current_user.get("role") != models.UserRole.EMPLOYEE.value:
+            drafts_cursor = db.schedule_drafts.find({
+                "franchise_code": franchise_code,
+                "$or": [
+                    {"start_date": {"$lte": end_date}, "end_date": {"$gte": start_date}}
+                ]
+            })
+            async for dft in drafts_cursor:
+                merged_schedule_content.update(dft.get("schedule", {}))
+
+        store_settings = await db.storesettings.find_one({"franchise_code": franchise_code}) or {}
         
         sick_leaves = await db.sick_leaves.find({
             "franchise_code": franchise_code,
@@ -299,7 +310,7 @@ async def get_schedule_pdf_endpoint(
         if franchise_code and franchise_code not in user_franchises:
             user_franchises.append(franchise_code)
         
-        # Wyszukaj grafik
+        # Wyszukaj grafik w opublikowanych lub wersjach roboczych
         schedule = await db.schedules.find_one({"_id": oid})
         if not schedule:
             schedule = await db.schedule_drafts.find_one({"_id": oid})
@@ -314,27 +325,31 @@ async def get_schedule_pdf_endpoint(
                 raise HTTPException(status_code=403, detail="Brak uprawnień do tego grafiku")
 
         # Pracownik widzi tylko opublikowane
+        is_published = schedule.get("is_published", False) or schedule.get("status") == "published"
         if current_user.get("role") == models.UserRole.EMPLOYEE.value:
-            if not schedule.get("is_published", False):
+            if not is_published:
                 raise HTTPException(status_code=403, detail="Grafik roboczy jest niedostępny dla pracowników")
 
-        store_settings = await db.store_settings.find_one({"franchise_code": sched_franchise}) or {}
+        store_settings = await db.storesettings.find_one({"franchise_code": sched_franchise}) or {}
 
         # WZBOGACENIE O GODZINY (Święta i Ustawienia)
         await enrich_schedule_data(db, sched_franchise, schedule)
 
-        start_date = schedule.get("start_date")
-        end_date = schedule.get("end_date")
+        raw_start = schedule.get("start_date")
+        raw_end = schedule.get("end_date")
         
-        if isinstance(start_date, str):
-            start_date = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-        if isinstance(end_date, str):
-            end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-        
-        if isinstance(start_date, date) and not isinstance(start_date, datetime):
-            start_date = datetime.combine(start_date, time.min)
-        if isinstance(end_date, date) and not isinstance(end_date, datetime):
-            end_date = datetime.combine(end_date, time.max)
+        def safe_dt(val, is_end=False):
+            if isinstance(val, datetime): return val
+            if isinstance(val, date): return datetime.combine(val, time.max if is_end else time.min)
+            if isinstance(val, str):
+                try:
+                    d = datetime.strptime(val.replace("Z", "").split("T")[0], "%Y-%m-%d").date()
+                    return datetime.combine(d, time.max if is_end else time.min)
+                except: pass
+            return datetime.now()
+
+        start_date = safe_dt(raw_start, False)
+        end_date = safe_dt(raw_end, True)
 
         sick_leaves = await db.sick_leaves.find({
             "franchise_code": sched_franchise,

@@ -9,7 +9,12 @@ from bson import ObjectId
 from ..database import get_db
 from ..dependencies import get_current_admin_user, get_current_active_user, get_current_user_query
 from .. import schemas, models
-from ..services.pdf_service import generate_hours_report_pdf, parse_time
+from ..services.pdf_service import (
+    generate_hours_report_pdf, 
+    generate_employee_hours_report_pdf, 
+    generate_franchisee_matrix_hours_report_pdf, 
+    parse_time
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -222,9 +227,49 @@ async def get_hours_report_pdf_endpoint(
             ]
         }).to_list(length=None) if franchise_code_for_l4 else []
 
-        pdf_buffer = generate_hours_report_pdf(report_data, start_date, end_date, sick_leaves)
-        
-        filename = f"Raport_Godzin_{start_date}_{end_date}.pdf"
+        if target_user_id:
+            # 1. RAPORT INDYWIDUALNY DLA PRACOWNIKA (Pionowa karta, bez wypłaty)
+            user_obj = user_dict.get(ObjectId(str(target_user_id))) or user_dict.get(str(target_user_id))
+            if not user_obj:
+                user_obj = await db.users.find_one({"_id": ObjectId(str(target_user_id))}) or current_user
+            
+            vacations = await db.vacations.find({
+                "user_id": {"$in": [ObjectId(str(target_user_id)), str(target_user_id)]},
+                "status": models.VacationStatus.APPROVED.value,
+                "start_date": {"$lte": datetime.combine(end_date, time.max)},
+                "end_date": {"$gte": datetime.combine(start_date, time.min)}
+            }).to_list(length=None)
+
+            pdf_buffer = generate_employee_hours_report_pdf(
+                report_data=report_data,
+                user_info=user_obj,
+                start_date=start_date,
+                end_date=end_date,
+                sick_leaves=sick_leaves,
+                vacations=vacations
+            )
+            safe_last = "".join(c for c in user_obj.get("last_name", "Pracownik") if c.isalnum())
+            filename = f"Karta_Czasu_Pracy_{safe_last}_{start_date}_{end_date}.pdf"
+        else:
+            # 2. RAPORT ZBIORCZY DLA FRANCZYZOBIORCY (Tabela macierzowa: rzędy dni, kolumny pracowników)
+            vacations = await db.vacations.find({
+                "franchise_code": franchise_code_for_l4,
+                "status": models.VacationStatus.APPROVED.value,
+                "start_date": {"$lte": datetime.combine(end_date, time.max)},
+                "end_date": {"$gte": datetime.combine(start_date, time.min)}
+            }).to_list(length=None) if franchise_code_for_l4 else []
+
+            all_store_employees = franchise_users if 'franchise_users' in locals() and franchise_users else list(user_dict.values())
+            pdf_buffer = generate_franchisee_matrix_hours_report_pdf(
+                report_data=report_data,
+                all_employees=all_store_employees,
+                start_date=start_date,
+                end_date=end_date,
+                sick_leaves=sick_leaves,
+                vacations=vacations,
+                franchise_code=franchise_code_for_l4 or "Sklep"
+            )
+            filename = f"Zestawienie_Godzin_{franchise_code_for_l4 or 'sklep'}_{start_date}_{end_date}.pdf"
         
         return StreamingResponse(
             pdf_buffer, 

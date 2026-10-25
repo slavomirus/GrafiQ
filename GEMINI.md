@@ -308,5 +308,26 @@ npm run ios
     * **Opcja Własna (W):** W selektorze typów zmian dodano opcję `Własna (W)`, która nie nadpisuje ręcznie wpisanych godzin predefiniowanymi przedziałami.
   * **Wydanie wersji 1.5.47 (versionCode 37):** Pomyślna kompilacja `app-release.aab`.
 
+* **2026-10-26 (Sesja 2):**
+  * **Kompleksowa modernizacja generatora PDF i raportów (urlopy, grafik, karty czasu pracy, zestawienia franczyzobiorcy):**
+    * **Przyczyny awarii generowania PDF:**
+      1. **Błąd kolekcji w MongoDB (`schedule.py`):** W zapytaniach o ustawienia placówki odwoływano się do nieistniejącej kolekcji `db.store_settings` zamiast `db.storesettings`.
+      2. **ReportLab `LayoutError: Table is too wide`:** Dynamiczne tabele grafiku przekraczały szerokość strony A4 Landscape (marginesy 12pt, dostępna szerokość 817.89pt), co wywoływało HTTP 500 przy tworzeniu dokumentu ReportLab.
+      3. **Blokada wniosków urlopowych:** Endpoint `GET /vacation/{id}/pdf` twardo wymagał statusu `APPROVED`, blokując pobieranie i podgląd wniosków oczekujących lub archiwalnych.
+      4. **Brak wsparcia dla wersji roboczych u franczyzobiorcy:** W `/{schedule_id}/pdf` oraz `/month-pdf` brakowało fallbacku do szkiców (`schedules_drafts`) przy generowaniu podglądu PDF dla pracodawcy.
+      5. **Błąd UI w aplikacji mobilnej (`RozliczeniaScreen.js`):** Zmienna `isFranchisee` nie była zdefiniowana w komponencie (`ReferenceError`), powodując awarię ekranu rozliczeń przy próbie otwarcia przez franczyzobiorcę. Ekran nie był także zarejestrowany w `FranchiseeNavigator` w `App.tsx`.
+    * **Backend (`pdf_service.py`, `reports.py`, `schedule.py`, `vacation.py`):**
+      * Zbudowano dedykowany generator **Karty Czasu Pracy Pracownika** (`generate_employee_hours_report_pdf`): format A4 Portrait, zestawienie zmian, godzin, urlopów i L4, formalne pola na podpisy, **rygorystyczny brak stawek godzinowych i prognozowanych wypłat** (zgodnie z wymaganiem biznesowym).
+      * Zbudowano pełne **Zestawienie Czasu Pracy Personelu dla Franczyzobiorcy** (`generate_franchisee_matrix_hours_report_pdf`): matryca z **rzędami dni miesiąca (1..31) i kolumnami pracowników sklepu**, w komórkach godziny zmian (np. `06:00-14:30`) oraz sumy godzin per pracownik i suma całego sklepu na dole.
+      * Przepisano generator grafiku (`generate_schedule_pdf`) z gwarancją sztywnych szerokości kolumn mieszczących się w limitach ReportLab bez ryzyka `LayoutError`.
+      * Dodano generator wniosku urlopowego (`generate_vacation_request_pdf`) dostępny dla pracowników i pracodawcy dla każdego statusu wniosku.
+      * W `reports.py` rozdzielono logikę: zapytanie bez `target_user_id` generuje matrycę sklepu dla franczyzobiorcy, a z `target_user_id` imienną kartę pracownika.
+    * **Frontend Mobilny (`RozliczeniaScreen.js`, `VacationScreen.js`, `FranchiseeRequestsScreen.js`, `App.tsx`):**
+      * W `RozliczeniaScreen.js` zdefiniowano `isFranchisee`, zaktualizowano etykiety przycisków ("Pobierz Pełne Zestawienie Godzinowe (PDF)" dla franczyzobiorcy, "Pobierz Kartę Czasu Pracy (PDF)" dla pracownika) oraz dodano opcję pobrania imiennej karty dla każdego pracownika z poziomu jego rozwiniętej karty w panelu pracodawcy.
+      * W `App.tsx` zarejestrowano `Rozliczenia` w `FranchiseeNavigator`.
+      * W `VacationScreen.js` dodano przycisk "Podgląd wniosku PDF" dla każdego złożonego wniosku w historii.
+      * W `FranchiseeRequestsScreen.js` odblokowano podgląd PDF dla każdego wniosku urlopowego (niezależnie od statusu).
+  * **Wydanie wersji 1.5.48 (versionCode 38):** Pomyślna kompilacja `app-release.aab`.
+
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

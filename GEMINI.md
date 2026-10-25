@@ -284,6 +284,14 @@ npm run ios
     * **Frontend Mobilny (`ScheduleHistoryScreen.js`):**
       * Ujednolicono wejście do grafiku: zarówno kliknięcie karty grafiku, jak i przycisku akcji "Podgląd / Edytuj" prowadzi bezpośrednio do `EditScheduleScreen`.
       * Usunięto przestarzały, martwy kod modalowy oraz wyeliminowano ostrzeżenia lintera ESLint.
+  * **Naprawa krytycznego crashu na starcie aplikacji (Crashlytics Build ID missing):**
+    * **Objaw:** Aplikacja po aktualizacji z Google Play do wersji 1.5.45 natychmiast zamykała się po kliknięciu ikonki ("wywala się do głównego ekranu").
+    * **Przyczyna:** Wykryta w zrzucie `adb logcat`: `java.lang.IllegalStateException: The Crashlytics build ID is missing. This occurs when the Crashlytics Gradle plugin is missing from your app's build configuration.` W projekcie dodano moduł `@react-native-firebase/crashlytics`, jednak w konfiguracji Gradle (`android/build.gradle` i `android/app/build.gradle`) brakowało wtyczki `com.google.firebase.crashlytics` generującej unikalny build ID dla Crashlytics podczas kompilacji.
+    * **Rozwiązanie:**
+      * W `android/build.gradle` dodano `classpath 'com.google.firebase:firebase-crashlytics-gradle:3.0.3'`.
+      * W `android/app/build.gradle` dodano `apply plugin: 'com.google.firebase.crashlytics'` oraz zależność `implementation 'com.google.firebase:firebase-crashlytics'`.
+      * Zweryfikowano działanie na czystym emulatorze Androida – aplikacja uruchamia się w ułamku sekundy, a proces żyje stabilnie bez żadnych błędów.
+      * Podbito wersję produkcyjną do `1.5.46` (`versionCode 36`) i pomyślnie wygenerowano nową paczkę `app-release.aab`.
 
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

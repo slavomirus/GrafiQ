@@ -328,6 +328,12 @@ npm run ios
       * W `VacationScreen.js` dodano przycisk "Podgląd wniosku PDF" dla każdego złożonego wniosku w historii.
       * W `FranchiseeRequestsScreen.js` odblokowano podgląd PDF dla każdego wniosku urlopowego (niezależnie od statusu).
   * **Wydanie wersji 1.5.48 (versionCode 38):** Pomyślna kompilacja `app-release.aab`.
+  * **Kafelki pod kalendarzem pracownika (`DashboardScreen.js` - wersja 1.5.49, versionCode 39):**
+    * Pod kalendarzem z grafikiem na dany miesiąc dodano dwa nowoczesne, zintegrowane kafelki:
+      1. **Kafelek Sumy Godzin (`ilość_przepracownych_godzin / ilość_godzin_w_miesiącu`):** Wyświetla `stats.workedHours` do dzisiaj włącznie oraz plan/wymiar miesięczny `stats.targetHours` (z fallbackiem do `monthly_hours_target`), z etykietą stanu ("Przepracowano / Plan" lub "Norma zrealizowana").
+      2. **Kafelek Pobierania Raportu Godzinowego (PDF):** Bezpośredni, klikalny kafelek z ikoną PDF generujący i otwierający Kartę Czasu Pracy danego pracownika w `PDFViewerScreen`.
+    * W `fetchStats` oraz `handleDownloadReport` dodano obsługę `targetUserId = employeeId || user._id`.
+  * **Wydanie wersji 1.5.49 (versionCode 39):** Pomyślna kompilacja `app-release.aab`.
 
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

@@ -1,6 +1,6 @@
 # Plik: backend/app/schemas.py
 
-from pydantic import BaseModel, EmailStr, SecretStr, Field, field_validator, model_validator, field_serializer
+from pydantic import BaseModel, EmailStr, SecretStr, Field, field_validator, model_validator, field_serializer, ConfigDict
 from enum import Enum
 from datetime import date, time, datetime, timedelta
 from typing import Optional, List, Dict, Any, Union
@@ -142,11 +142,32 @@ class ShiftHours(BaseModel):
     end_time: time
 
 class OpeningHoursDay(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     start_time: time = Field(alias="from")
     end_time: time = Field(alias="to")
 
-    class Config:
-        populate_by_name = True
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_aliases(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            st = data.get("start_time")
+            fr = data.get("from")
+            # Jeśli start_time został podany/zaktualizowany, priorytetyzujemy go nad starym 'from'
+            if st is not None and (fr is None or str(st).strip() != str(fr).strip()):
+                data["from"] = st
+            elif fr is not None:
+                data["start_time"] = fr
+
+            et = data.get("end_time")
+            to_val = data.get("to")
+            # Jeśli end_time został podany/zaktualizowany, priorytetyzujemy go nad starym 'to'
+            if et is not None and (to_val is None or str(et).strip() != str(to_val).strip()):
+                data["to"] = et
+            elif to_val is not None:
+                data["end_time"] = to_val
+        return data
 
 class OpeningHoursHoliday(BaseModel):
     open_time: time = Field(alias="open")

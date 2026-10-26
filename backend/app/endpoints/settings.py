@@ -90,6 +90,20 @@ async def create_or_update_store_settings(
     # FIX: Konwersja time -> str dla MongoDB (bson nie obsługuje datetime.time)
     settings_dict = jsonable_encoder(settings_data)
 
+    # Ujednolicenie opening_hours (gwarancja obecności zarówno from/to jak i start_time/end_time)
+    if "opening_hours" in settings_dict and isinstance(settings_dict["opening_hours"], dict):
+        for day_key in ["weekday", "sunday"]:
+            d_cfg = settings_dict["opening_hours"].get(day_key)
+            if isinstance(d_cfg, dict):
+                f_val = d_cfg.get("from") or d_cfg.get("start_time")
+                t_val = d_cfg.get("to") or d_cfg.get("end_time")
+                if f_val:
+                    d_cfg["from"] = str(f_val)[:5]
+                    d_cfg["start_time"] = str(f_val)[:5]
+                if t_val:
+                    d_cfg["to"] = str(t_val)[:5]
+                    d_cfg["end_time"] = str(t_val)[:5]
+
     # Użycie operacji upsert (update or insert)
     await db.storesettings.update_one(
         {"franchise_code": franchise_code},

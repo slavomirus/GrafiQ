@@ -101,12 +101,12 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
         if is_commercial and date_obj in STATUTORY_COMMERCIAL_SUNDAYS:
             # Jeśli niedziela handlowa, traktuj jak zwykły dzień (korzystaj z godzin weekday)
             weekday_settings = opening_hours.get("weekday", {})
-            open_time_str = weekday_settings.get("from", "06:00")
-            close_time_str = weekday_settings.get("to", "23:00")
+            open_time_str = weekday_settings.get("from") or weekday_settings.get("start_time") or "06:00"
+            close_time_str = weekday_settings.get("to") or weekday_settings.get("end_time") or "23:00"
         else:
             sunday_settings = opening_hours.get("sunday", {})
-            open_time_str = sunday_settings.get("from", "09:00")
-            close_time_str = sunday_settings.get("to", "21:00")
+            open_time_str = sunday_settings.get("from") or sunday_settings.get("start_time") or "10:00"
+            close_time_str = sunday_settings.get("to") or sunday_settings.get("end_time") or "20:00"
             special_day = True
 
     if special_day:

@@ -354,5 +354,22 @@ npm run ios
       * W `EditScheduleScreen.js` wdrożono tryb edycji zmiany w `DayEditModal` (ikona ołówka, podświetlenie edytowanego wiersza, baner informacyjny, dynamiczny przycisk `✓ Zapisz Zmianę` / `+ Dodaj Zmianę`), podłączono `handleUpdateShift` oraz zabezpieczono fallback `shift_id` przy usuwaniu.
   * **Wydanie wersji 1.5.50 (versionCode 40):** Pomyślna kompilacja `app-release.aab`.
 
+* **2026-10-26 (Sesja 4):**
+  * **Diagnoza i naprawa braku zapisu godzin otwarcia w niedziele w panelu franczyzobiorcy:**
+    * **Przyczyna awarii:**
+      1. **Konflikt aliasów w schemacie Pydantic `OpeningHoursDay`:** Pole `start_time` posiadało alias `"from"`, a pole `end_time` posiadało alias `"to"`. Gdy frontend pobierał ustawienia, otrzymywał obiekt zawierający klucze `"from"` i `"to"`.
+      2. **Niezsynchronizowana zmiana w stanie React Native (`StoreSettingsComponent.js` i `StoreSettingsScreen.js`):** Funkcja `handleTimeChange('sunday', 'start_time', val)` dopisywała do obiektu klucz `start_time: val`, pozostawiając w nim stary klucz `from: "10:00"`.
+      3. **Priorytet aliasów Pydantic v2:** Podczas walidacji payloadu zapisu Pydantic v2 traktował klucz aliasu `"from"` priorytetowo, ignorując zaktualizowaną wartość `start_time: "11:00"`. W efekcie serwer zapisywał do bazy z powrotem starą godzinę ("10:00"-"20:00").
+      4. **Snapping pustego pola przy edycji:** Użycie operatora `||` (`formatTime(start_time || from)`) powodowało, że przy wyczyszczeniu pola tekstowego (pusty string `""`) wartość natychmiast wracała do starej godziny z pola `from`.
+    * **Backend (`schemas.py`, `settings.py`, `schedule_service.py`):**
+      * W `OpeningHoursDay` wdrożono `model_config = ConfigDict(populate_by_name=True)` oraz `@model_validator(mode="before") resolve_aliases` – priorytetyzujący zaktualizowane wartości `start_time` / `end_time` nad starymi polami `from` / `to`.
+      * W `settings.py` (`create_or_update_store_settings`) dodano automatyczną normalizację zapisującą do MongoDB oba warianty kluczy (`from`, `to`, `start_time`, `end_time`) w ujednoliconym formacie `"HH:MM"`.
+      * W `schedule_service.py` (`resolve_shift_hours`) dodano fallback sprawdzający zarówno `.get("from")` jak i `.get("start_time")`.
+    * **Frontend Mobilny (`StoreSettingsComponent.js`, `StoreSettingsScreen.js`):**
+      * Zrefaktoryzowano `handleTimeChange`, aby symultanicznie aktualizował pary `start_time` / `from` oraz `end_time` / `to`.
+      * Zastąpiono operator `||` operatorem nullish coalescing `??` w powiązaniach pól `value` komponentu `TextInput` / `TimeRangePicker`.
+      * Po udanym zapisie `storeAPI.updateStoreSettings` stan `settings` jest aktualizowany danymi zwróconymi przez serwer (`setSettings(prev => ({ ...prev, ...res.data }))`).
+  * **Wydanie wersji 1.5.51 (versionCode 41):** Pomyślna kompilacja `app-release.aab`.
+
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

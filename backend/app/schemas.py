@@ -621,8 +621,10 @@ class EmployeeAssignment(BaseModel):
     employee_id: PyObjectId
 
 class ShiftHoursUpdate(BaseModel):
-    start_time: time
-    end_time: time
+    start_time: Any
+    end_time: Any
+    shift_type: Optional[str] = None
+    user_id: Optional[str] = None
 
 class DraftShiftUpdate(BaseModel):
     date: date

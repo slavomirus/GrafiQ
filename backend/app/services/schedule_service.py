@@ -13,6 +13,7 @@ import json
 import calendar
 import uuid
 from .validator_service import ScheduleValidator
+from .notification_service import send_push_to_user
 
 # Ustawowe niedziele handlowe w Polsce (2024 - 2026)
 STATUTORY_COMMERCIAL_SUNDAYS = {
@@ -309,38 +310,132 @@ async def enrich_schedule_data(db: motor.motor_asyncio.AsyncIOMotorDatabase, fra
 
 # Poniżej reszta pliku bez zmian
 async def update_shift_hours(db: motor.motor_asyncio.AsyncIOMotorDatabase, shift_id: str, shift_data: schemas.ShiftHoursUpdate, current_user: dict):
+    schedule_id_str = None
+    date_str = None
+    shift_name = None
+    user_id_str = shift_data.user_id
+
+    # 1. Dekodowanie ID (base64 lub string)
     try:
         decoded_id = base64.b64decode(shift_id).decode('utf-8')
-        schedule_id_str, date_str, shift_name = decoded_id.split(':')
-        schedule_id = ObjectId(schedule_id_str)
+        parts = decoded_id.split(':')
+        if len(parts) >= 3:
+            schedule_id_str = parts[0]
+            date_str = parts[1]
+            shift_name = parts[2]
+            if len(parts) >= 4 and not user_id_str:
+                user_id_str = parts[3]
     except Exception:
+        pass
+
+    if not schedule_id_str and ":" in shift_id:
+        parts = shift_id.split(':')
+        if len(parts) >= 3:
+            schedule_id_str = parts[0]
+            date_str = parts[1]
+            shift_name = parts[2]
+            if len(parts) >= 4 and not user_id_str:
+                user_id_str = parts[3]
+
+    if not schedule_id_str or not date_str or not shift_name:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nieprawidłowy format ID zmiany.")
 
-    franchise_code = current_user.get("franchise_code")
-    if not franchise_code:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Użytkownik nie jest przypisany.")
+    try:
+        schedule_id = ObjectId(schedule_id_str)
+    except Exception:
+        schedule_id = schedule_id_str
 
-    schedule = await db.schedules.find_one({"_id": schedule_id, "franchise_code": franchise_code})
+    franchise_code = current_user.get("franchise_code")
+    franchise_codes = current_user.get("franchise_codes", [])
+    if franchise_code and franchise_code not in franchise_codes:
+        franchise_codes.append(franchise_code)
+
+    schedule = await db.schedules.find_one({
+        "_id": schedule_id,
+        "franchise_code": {"$in": franchise_codes} if franchise_codes else franchise_code
+    })
+    is_draft = False
+    if not schedule:
+        schedule = await db.schedules_drafts.find_one({
+            "_id": schedule_id,
+            "franchise_code": {"$in": franchise_codes} if franchise_codes else franchise_code
+        })
+        is_draft = True
 
     if not schedule:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Grafik nie został znaleziony.")
 
-    if date_str not in schedule.get("schedule", {}) or shift_name not in schedule.get("schedule", {}).get(date_str, {}):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Zmiana nie została znaleziona.")
+    target_franchise_code = schedule.get("franchise_code") or franchise_code
+    collection = db.schedules_drafts if is_draft else db.schedules
 
-    if shift_data.end_time <= shift_data.start_time:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Złe godziny.")
+    # Bezpieczna serializacja czasów (obsługa time oraz string "HH:MM")
+    if hasattr(shift_data.start_time, 'strftime'):
+        start_time_str = shift_data.start_time.strftime('%H:%M')
+    else:
+        start_time_str = str(shift_data.start_time)[:5]
 
-    update_path_start = f"schedule.{date_str}.{shift_name}.start_time"
-    update_path_end = f"schedule.{date_str}.{shift_name}.end_time"
+    if hasattr(shift_data.end_time, 'strftime'):
+        end_time_str = shift_data.end_time.strftime('%H:%M')
+    else:
+        end_time_str = str(shift_data.end_time)[:5]
 
-    start_time_str = shift_data.start_time.strftime('%H:%M')
-    end_time_str = shift_data.end_time.strftime('%H:%M')
+    # Mapowanie klucza zmiany (np. mid vs middle)
+    shift_keys = [shift_name]
+    if shift_name == "mid":
+        shift_keys.append("middle")
+    elif shift_name == "middle":
+        shift_keys.append("mid")
 
-    result = await db.schedules.update_one(
-        {"_id": schedule_id},
+    day_schedule = schedule.get("schedule", {}).get(date_str, {})
+    matched_key = shift_name
+    for k in shift_keys:
+        if k in day_schedule:
+            matched_key = k
+            break
+
+    # Aktualizacja godzin w obiekcie grafiku (db.schedules / db.schedules_drafts)
+    update_path_start = f"schedule.{date_str}.{matched_key}.start_time"
+    update_path_end = f"schedule.{date_str}.{matched_key}.end_time"
+
+    await collection.update_one(
+        {"_id": schedule["_id"]},
         {"$set": {update_path_start: start_time_str, update_path_end: end_time_str}}
     )
+
+    # Jeśli zmiana dotyczy konkretnego pracownika, aktualizujemy także jego wpis w tablicy employees
+    if user_id_str:
+        user_oid = ObjectId(user_id_str) if ObjectId.is_valid(user_id_str) else None
+        await collection.update_one(
+            {
+                "_id": schedule["_id"],
+                f"schedule.{date_str}.{matched_key}.employees.id": str(user_id_str)
+            },
+            {
+                "$set": {
+                    f"schedule.{date_str}.{matched_key}.employees.$.start_time": start_time_str,
+                    f"schedule.{date_str}.{matched_key}.employees.$.end_time": end_time_str,
+                }
+            }
+        )
+
+        # Aktualizujemy płaską kolekcję db.schedule (dla Dashboardu pracownika)
+        if not is_draft:
+            shift_d = datetime.strptime(date_str, "%Y-%m-%d").date()
+            u_target = user_oid if user_oid else user_id_str
+            await db.schedule.update_one(
+                {
+                    "user_id": u_target,
+                    "franchise_code": target_franchise_code,
+                    "date": datetime.combine(shift_d, time.min)
+                },
+                {
+                    "$set": {
+                        "start_time": start_time_str,
+                        "end_time": end_time_str,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
 
     return {"message": "Godziny zaktualizowane."}
 
@@ -603,8 +698,262 @@ async def get_employee_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabase, cu
 async def update_draft_shift(db, draft_id, shift_data, current_user):
     pass
 
-async def add_shift_to_schedule(db, schedule_id, shift_data, current_user):
-    pass
+async def add_shift_to_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabase, schedule_id: str, shift_data: dict, current_user: dict):
+    user_id_str = shift_data.get("user_id")
+    date_str = shift_data.get("date")
+    shift_type = shift_data.get("shift_type", "morning")
+    start_time_str = shift_data.get("start_time", "06:00")
+    end_time_str = shift_data.get("end_time", "14:30")
 
-async def delete_shift_from_schedule(db, shift_id_encoded, current_user):
-    pass
+    if not user_id_str or not date_str:
+        raise HTTPException(status_code=400, detail="Wymagane pola: user_id oraz date.")
+
+    # Format times to HH:MM
+    if len(start_time_str) > 5:
+        start_time_str = start_time_str[:5]
+    if len(end_time_str) > 5:
+        end_time_str = end_time_str[:5]
+
+    franchise_code = current_user.get("franchise_code")
+    franchise_codes = current_user.get("franchise_codes", [])
+    if franchise_code and franchise_code not in franchise_codes:
+        franchise_codes.append(franchise_code)
+
+    sched_query = {}
+    if ObjectId.is_valid(schedule_id):
+        sched_query["_id"] = ObjectId(schedule_id)
+    else:
+        sched_query["_id"] = schedule_id
+
+    schedule_doc = await db.schedules.find_one(sched_query)
+    is_draft = False
+    if not schedule_doc:
+        schedule_doc = await db.schedules_drafts.find_one(sched_query)
+        is_draft = True
+
+    if not schedule_doc:
+        raise HTTPException(status_code=404, detail="Grafik nie został znaleziony.")
+
+    target_franchise_code = schedule_doc.get("franchise_code") or franchise_code
+    sched_id = schedule_doc["_id"]
+    collection = db.schedules_drafts if is_draft else db.schedules
+
+    day_sched = schedule_doc.get("schedule", {}).get(date_str, {})
+    shift_key = shift_type
+    if shift_type in ["mid", "middle"]:
+        if "middle" in day_sched:
+            shift_key = "middle"
+        elif "mid" in day_sched:
+            shift_key = "mid"
+        else:
+            shift_key = "middle"
+
+    user_oid = ObjectId(user_id_str) if ObjectId.is_valid(user_id_str) else None
+    user_doc = None
+    if user_oid:
+        user_doc = await db.users.find_one({"_id": user_oid})
+    if not user_doc:
+        user_doc = await db.users.find_one({"_id": user_id_str})
+
+    first_name = user_doc.get("first_name", "") if user_doc else ""
+    last_name = user_doc.get("last_name", "") if user_doc else ""
+
+    emp_obj = {
+        "id": str(user_id_str),
+        "first_name": first_name,
+        "last_name": last_name,
+        "start_time": start_time_str,
+        "end_time": end_time_str
+    }
+
+    pull_filters = [
+        {"id": str(user_id_str)},
+        {"_id": str(user_id_str)},
+        str(user_id_str)
+    ]
+    if user_oid:
+        pull_filters.extend([{"id": user_oid}, {"_id": user_oid}, user_oid])
+
+    # Usuń ewentualne stare przypisanie tego pracownika w tym dniu
+    for k in ["morning", "mid", "middle", "closing", shift_key]:
+        for pf in pull_filters:
+            await collection.update_one(
+                {"_id": sched_id},
+                {"$pull": {f"schedule.{date_str}.{k}.employees": pf}}
+            )
+
+    update_ops = {
+        f"schedule.{date_str}.{shift_key}.start_time": start_time_str,
+        f"schedule.{date_str}.{shift_key}.end_time": end_time_str,
+    }
+    await collection.update_one(
+        {"_id": sched_id},
+        {
+            "$set": update_ops,
+            "$push": {f"schedule.{date_str}.{shift_key}.employees": emp_obj}
+        }
+    )
+
+    if not is_draft:
+        shift_d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        u_target = user_oid if user_oid else user_id_str
+        await db.schedule.update_one(
+            {
+                "user_id": u_target,
+                "franchise_code": target_franchise_code,
+                "date": datetime.combine(shift_d, time.min)
+            },
+            {
+                "$set": {
+                    "user_id": u_target,
+                    "franchise_code": target_franchise_code,
+                    "date": datetime.combine(shift_d, time.min),
+                    "start_time": start_time_str,
+                    "end_time": end_time_str,
+                    "shift_type": shift_key,
+                    "updated_at": datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
+
+    if user_oid:
+        try:
+            await send_push_to_user(
+                db,
+                user_oid,
+                "Nowa zmiana w grafiku",
+                f"Zostałeś przypisany do zmiany {shift_key} ({start_time_str}-{end_time_str}) w dniu {date_str}."
+            )
+        except Exception as e:
+            logger.warning(f"Nie udało się wysłać powiadomienia push: {e}")
+
+    return {"message": "Zmiana została pomyślnie dodana."}
+
+async def delete_shift_from_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabase, shift_id_encoded: str, current_user: dict):
+    schedule_id_str = None
+    date_str = None
+    shift_name = None
+    user_id_str = None
+
+    try:
+        decoded = base64.b64decode(shift_id_encoded).decode('utf-8')
+        parts = decoded.split(':')
+        if len(parts) >= 3:
+            schedule_id_str = parts[0]
+            date_str = parts[1]
+            shift_name = parts[2]
+            if len(parts) >= 4:
+                user_id_str = parts[3]
+    except Exception:
+        pass
+
+    if not schedule_id_str and ":" in shift_id_encoded:
+        parts = shift_id_encoded.split(':')
+        if len(parts) >= 3:
+            schedule_id_str = parts[0]
+            date_str = parts[1]
+            shift_name = parts[2]
+            if len(parts) >= 4:
+                user_id_str = parts[3]
+
+    if not date_str and "-" in shift_id_encoded:
+        parts = shift_id_encoded.split('-')
+        if len(parts) >= 5:
+            date_str = f"{parts[0]}-{parts[1]}-{parts[2]}"
+            shift_name = parts[3]
+            user_id_str = parts[4]
+
+    if not date_str or not shift_name:
+        raise HTTPException(status_code=400, detail="Nieprawidłowy format ID zmiany.")
+
+    franchise_code = current_user.get("franchise_code")
+    franchise_codes = current_user.get("franchise_codes", [])
+    if franchise_code and franchise_code not in franchise_codes:
+        franchise_codes.append(franchise_code)
+
+    schedule_doc = None
+    if schedule_id_str:
+        sched_query = {}
+        if ObjectId.is_valid(schedule_id_str):
+            sched_query["_id"] = ObjectId(schedule_id_str)
+        else:
+            sched_query["_id"] = schedule_id_str
+
+        schedule_doc = await db.schedules.find_one(sched_query)
+        if not schedule_doc:
+            schedule_doc = await db.schedules_drafts.find_one(sched_query)
+
+    if not schedule_doc and franchise_codes:
+        shift_d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        schedule_doc = await db.schedules.find_one({
+            "franchise_code": {"$in": franchise_codes},
+            "start_date": {"$lte": shift_d},
+            "end_date": {"$gte": shift_d}
+        })
+
+    if not schedule_doc:
+        raise HTTPException(status_code=404, detail="Grafik nie został znaleziony.")
+
+    target_franchise_code = schedule_doc.get("franchise_code") or franchise_code
+    sched_id = schedule_doc["_id"]
+    is_draft = "draft_id" in schedule_doc or schedule_doc.get("status") == "DRAFT"
+    collection = db.schedules_drafts if is_draft else db.schedules
+
+    shift_keys = [shift_name]
+    if shift_name == "mid":
+        shift_keys.append("middle")
+    elif shift_name == "middle":
+        shift_keys.append("mid")
+
+    for s_key in shift_keys:
+        if user_id_str:
+            user_oid = ObjectId(user_id_str) if ObjectId.is_valid(user_id_str) else None
+            pull_filters = [
+                {"id": str(user_id_str)},
+                {"_id": str(user_id_str)},
+                str(user_id_str)
+            ]
+            if user_oid:
+                pull_filters.extend([{"id": user_oid}, {"_id": user_oid}, user_oid])
+
+            for pf in pull_filters:
+                await collection.update_one(
+                    {"_id": sched_id},
+                    {"$pull": {f"schedule.{date_str}.{s_key}.employees": pf}}
+                )
+        else:
+            await collection.update_one(
+                {"_id": sched_id},
+                {"$set": {f"schedule.{date_str}.{s_key}.employees": []}}
+            )
+
+    if not is_draft and user_id_str:
+        shift_d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        user_oid = ObjectId(user_id_str) if ObjectId.is_valid(user_id_str) else None
+        user_query = [str(user_id_str)]
+        if user_oid:
+            user_query.append(user_oid)
+
+        await db.schedule.delete_many({
+            "user_id": {"$in": user_query},
+            "franchise_code": target_franchise_code,
+            "date": {"$in": [
+                datetime.combine(shift_d, time.min),
+                shift_d,
+                date_str
+            ]}
+        })
+
+    if user_id_str and ObjectId.is_valid(user_id_str):
+        try:
+            await send_push_to_user(
+                db,
+                ObjectId(user_id_str),
+                "Zmiana w grafiku",
+                f"Zostałeś usunięty ze zmiany w dniu {date_str}."
+            )
+        except Exception as e:
+            logger.warning(f"Nie udało się wysłać powiadomienia push: {e}")
+
+    return {"message": "Zmiana została pomyślnie usunięta."}

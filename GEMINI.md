@@ -335,5 +335,24 @@ npm run ios
     * W `fetchStats` oraz `handleDownloadReport` dodano obsługę `targetUserId = employeeId || user._id`.
   * **Wydanie wersji 1.5.49 (versionCode 39):** Pomyślna kompilacja `app-release.aab`.
 
+* **2026-10-26 (Sesja 3):**
+  * **Diagnoza i naprawa błędu "undefined is not a function" przy edycji/usuwaniu pozycji na opublikowanym grafiku:**
+    * **Przyczyny awarii:**
+      1. **Puste metody backendu (`schedule_service.py`):** Metody `delete_shift_from_schedule` oraz `add_shift_to_schedule` były pustymi deklaracjami (`pass`), zwracając `None`. FastAPI rzucało `ResponseValidationError` przy walidacji ze schematem `MessageResponse` (HTTP 500).
+      2. **Parsowanie identyfikatora zmiany w `update_shift_hours`:** Backend dzielił `decoded_id.split(':')` na sztywno oczekując 3 elementów, podczas gdy frontend przesyłał identyfikator 4-elementowy (`schedule_id:date_str:shift_name:user_id`), powodując `ValueError` (HTTP 500).
+      3. **Maskowanie błędu HTTP 500 przez Crashlytics w Axios Interceptorze:** Gdy backend zwracał 500, interceptor odpowiedzi w `api.js` wywoływał `crashlytics().recordError(error)`. W środowiskach bez w pełni zainicjalizowanego Crashlytics wywołanie to rzucało `TypeError: undefined is not a function`. Ta treść błędu zastępowała oryginalny komunikat i była wyświetlana w modalu `Alert.alert('Błąd', apiError.error)` jako `"błąd undefined is not a function"`.
+      4. **Brak kodowania URL dla Base64:** Identyfikatory zmian zakodowane w base64 (zawierające znaki `/`, `+`, `=`) były przekazywane bezpośrednio w ścieżce URL, co łamało routing zapytań HTTP.
+      5. **Brak edycji godzin w UI:** W `DayEditModal` franczyzobiorca mógł jedynie usuwać lub dodawać pracownika, brakowało możliwości bezpośredniej modyfikacji godzin istniejącej zmiany.
+    * **Backend (`schedule_service.py`, `schemas.py`):**
+      * Zaimplementowano pełną logikę `delete_shift_from_schedule` usuwającą pracownika ze struktury zagnieżdżonej `db.schedules` / `db.schedules_drafts` oraz usuwającą wpis ze struktury płaskiej `db.schedule`, wraz z powiadomieniem push FCM.
+      * Zaimplementowano `add_shift_to_schedule` z obsługą normalizacji kluczy zmian, dodawaniem do obu kolekcji i wysyłką push.
+      * Zrefaktoryzowano `update_shift_hours` – obsługa 3- i 4-częściowych identyfikatorów, bezpieczna dekodacja base64/plain, synchronizacja zmian godzin i typu w obu kolekcjach MongoDB.
+      * W `ShiftHoursUpdate` oznaczono pola jako elastyczne (`start_time`, `end_time`, opcjonalne `shift_type`, `user_id`).
+    * **Frontend Mobilny (`api.js`, `EditScheduleScreen.js`):**
+      * W `api.js` zabezpieczono wywołanie Crashlytics blokiem `try ... catch` z weryfikacją `typeof recordError === 'function'`.
+      * Dodano `encodeURIComponent` dla parametrów `shiftId` w `scheduleAPI.updateShift` oraz `deleteShift`.
+      * W `EditScheduleScreen.js` wdrożono tryb edycji zmiany w `DayEditModal` (ikona ołówka, podświetlenie edytowanego wiersza, baner informacyjny, dynamiczny przycisk `✓ Zapisz Zmianę` / `+ Dodaj Zmianę`), podłączono `handleUpdateShift` oraz zabezpieczono fallback `shift_id` przy usuwaniu.
+  * **Wydanie wersji 1.5.50 (versionCode 40):** Pomyślna kompilacja `app-release.aab`.
+
 > *Notatka dla asystenta AI:* Po zakończeniu kolejnych prac programistycznych dopisz podsumowanie zmian w tej sekcji!
 

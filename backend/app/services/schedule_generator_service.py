@@ -260,10 +260,10 @@ class ScheduleGenerator:
                 fte_or_target = float(raw_fh) if raw_fh is not None and raw_fh != '' else 0.0
                 contract = "FRANCHISEE"
             elif is_uop:
-                fte_or_target = float(db_emp.get("fte", 1.0))
+                fte_or_target = float(db_emp.get("fte") or 1.0)
                 contract = "UOP"
             else:
-                fte_or_target = float(db_emp.get("monthly_hours_target", 120))
+                fte_or_target = float(db_emp.get("monthly_hours_target") or 120)
                 contract = "UZ"
 
             raw_prefs = db_emp.get("preferences", {}) or {}
@@ -532,17 +532,24 @@ class ScheduleGenerator:
             if not self._check_weekly_rest(emp, shift):
                 return False
 
-        # Art. 130 KP: Sztywny limit godzin dla UOP
-        if emp.is_uop:
-            if round(emp.worked_hours + shift.time_range.hours, 2) > round(emp.target_hours, 2):
-                return False
-        # Dla franczyzobiorcy i UZ, pozwól na lekkie przekroczenie (10%), ale nie jeśli cel to 0
-        elif emp.target_hours > 0 and round(emp.worked_hours + shift.time_range.hours, 2) > round(emp.target_hours * 1.1, 2):
-             return False
-        elif emp.target_hours <= 0 and shift.time_range.hours > 0:
+        # Limity godzin: UOP = 100% (Art. 130 KP), Franczyzobiorca = +10%, UZ = +50% (odchył +/- 50%)
+        max_hours = self._get_max_hours(emp)
+        if max_hours <= 0 and shift.time_range.hours > 0:
+            return False
+        if round(emp.worked_hours + shift.time_range.hours, 2) > round(max_hours, 2):
             return False
 
         return True
+
+    def _get_max_hours(self, emp: Employee) -> float:
+        """Zwraca maksymalny dopuszczalny wymiar godzin dla pracownika."""
+        if emp.target_hours <= 0:
+            return 0.0
+        if emp.is_uop:
+            return emp.target_hours
+        if emp.is_franchisee:
+            return emp.target_hours * 1.1
+        return emp.target_hours * 1.5
 
     def _assign(self, emp: Employee, shift: ShiftDemand):
         emp.assigned_shifts.append(shift)
@@ -616,6 +623,12 @@ class ScheduleGenerator:
             elif shift.shift_type == schemas.ShiftType.MIDDLE.value:
                 score += 50.0
 
+        # 6. Preferuj nieprzekraczanie bazowego celu godzinowego dla UZ (bufor +50% tylko w razie potrzeby)
+        if not emp.is_uop and not emp.is_franchisee and emp.target_hours > 0:
+            projected_ratio = (emp.worked_hours + shift.time_range.hours) / emp.target_hours
+            if projected_ratio > 1.0:
+                score -= (projected_ratio - 1.0) * 100.0
+
         return score
 
     async def generate(self, start_date: date, end_date: date):
@@ -670,11 +683,6 @@ class ScheduleGenerator:
             if candidates:
                 valid_candidates = []
                 for e in candidates:
-                    if e.is_uop and e.worked_hours + shift.time_range.hours > e.target_hours:
-                        continue
-                    if not e.is_uop and e.target_hours > 0 and e.worked_hours + shift.time_range.hours > e.target_hours * 1.2:
-                        continue
-                    
                     burn_rate = e.worked_hours / e.target_hours if e.target_hours > 0 else 1.0
                     valid_candidates.append((e, burn_rate))
                 
@@ -687,14 +695,10 @@ class ScheduleGenerator:
         for shift in slots:
             if shift.required_employees <= 0: continue
             
-            candidates = []
-            for e in self.employees:
-                if self._check_hard_constraints(e, shift):
-                    if e.is_uop and e.worked_hours + shift.time_range.hours > e.target_hours:
-                        continue
-                    if not e.is_uop and e.target_hours > 0 and e.worked_hours + shift.time_range.hours > e.target_hours * 1.2:
-                        continue
-                    candidates.append(e)
+            candidates = [
+                e for e in self.employees
+                if self._check_hard_constraints(e, shift)
+            ]
             
             if candidates:
                 scored_candidates = []
@@ -743,12 +747,22 @@ class ScheduleGenerator:
                     # Nie przydzielaj zmian pracownikom/ajentowi z docelowymi 0 godzin
                     if can_work and e.target_hours <= 0:
                         can_work = False
+
+                    # Dla umowy zlecenie nawet w fallbacku respektuj maksymalny odchył +50%
+                    if can_work and not e.is_uop and not e.is_franchisee:
+                        if round(e.worked_hours + shift.time_range.hours, 2) > round(e.target_hours * 1.5, 2):
+                            can_work = False
                             
                     if can_work:
                         fallback_candidates.append(e)
                 
                 if fallback_candidates:
-                    fallback_candidates.sort(key=lambda e: e.worked_hours)
+                    fallback_candidates.sort(
+                        key=lambda e: (
+                            e.worked_hours / e.target_hours if e.target_hours > 0 else float("inf"),
+                            e.worked_hours,
+                        )
+                    )
                     chosen = fallback_candidates[0]
                     self._assign(chosen, shift)
                     self.logs.append(f"[KRYTYCZNE - WYMUSZONO] Awaryjnie przypisano pracownika {chosen.first_name} {chosen.last_name} do zmiany '{shift.shift_type}' ({shift.time_range.start.date()}), ignorując docelowe czasy pracy.")

@@ -203,6 +203,8 @@ class StoreSettingsBase(BaseModel):
     employees_per_closing_shift: int = Field(default=1, ge=1, le=5)
     employees_on_promo_change: int = Field(default=2, ge=2, le=5)
     allow_overtime: bool = True
+    uop_overtime_percent: int = Field(default=0, ge=0, le=100, description="Dozwolone nadgodziny dla UOP (%) - np. 0, 25, 50, 60")
+    uz_overtime_percent: int = Field(default=50, ge=0, le=100, description="Dozwolone nadgodziny dla UZL (%) - np. 0, 25, 50, 60")
     allow_inter_store_work: bool = False
     require_swap_approval: bool = True
 
@@ -212,7 +214,8 @@ class StoreSettingsBase(BaseModel):
         default={
             "morning": {"start_time": "06:00", "end_time": "14:30"},
             "middle": {"start_time": "12:00", "end_time": "20:00"},
-            "closing": {"start_time": "14:30", "end_time": "23:00"}
+            "closing": {"start_time": "14:30", "end_time": "23:00"},
+            "promo": {"start_time": "14:30", "end_time": "23:00"}
         }
     )
 
@@ -246,8 +249,9 @@ class StoreSettings(StoreSettingsBase):
 class SpecialOpeningHoursBase(BaseModel):
     franchise_code: str
     date: date
-    open_time: time
-    close_time: time
+    open_time: Optional[time] = None
+    close_time: Optional[time] = None
+    is_closed: bool = False
 
 class SpecialOpeningHoursCreate(SpecialOpeningHoursBase):
     pass

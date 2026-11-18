@@ -6,7 +6,7 @@ import motor.motor_asyncio
 from bson import ObjectId
 import logging
 from typing import List, Union
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from ..database import get_db
 from ..dependencies import get_current_admin_user, get_current_active_user
@@ -14,6 +14,18 @@ from .. import schemas
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+async def _cleanup_old_special_hours(db: motor.motor_asyncio.AsyncIOMotorDatabase, franchise_code: str):
+    """Usuwa wpisy świąteczne / specjalne godziny starsze niż 3 miesiące (90 dni)."""
+    cutoff_dt = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=90)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d")
+    await db.specialopeninghours.delete_many({
+        "franchise_code": franchise_code,
+        "$or": [
+            {"date": {"$lt": cutoff_dt}},
+            {"date": {"$type": "string", "$lt": cutoff_str}}
+        ]
+    })
 
 @router.get("/store", response_model=schemas.StoreSettings)
 async def get_store_settings(
@@ -34,7 +46,8 @@ async def get_store_settings(
         # Dodaj _id, bo response_model tego wymaga (choć może być puste/nowe)
         settings["_id"] = ObjectId()
 
-    # Pobierz godziny specjalne (święta)
+    # Usuń święta starsze niż 3 miesiące i pobierz aktualne
+    await _cleanup_old_special_hours(db, franchise_code)
     special_hours_cursor = db.specialopeninghours.find({"franchise_code": franchise_code})
     special_hours_list = await special_hours_cursor.to_list(length=None)
     
@@ -52,7 +65,8 @@ async def get_store_settings(
             
         holiday_map[date_str] = {
             "open": sh.get("open_time"),
-            "close": sh.get("close_time")
+            "close": sh.get("close_time"),
+            "is_closed": sh.get("is_closed", False) or (sh.get("open_time") == sh.get("close_time"))
         }
 
     # Upewnij się, że struktura opening_hours istnieje
@@ -131,14 +145,19 @@ async def get_special_hours(
     current_user: dict = Depends(get_current_admin_user),
     db: motor.motor_asyncio.AsyncIOMotorDatabase = Depends(get_db)
 ):
-    """Pobiera listę dni ze specjalnymi godzinami otwarcia."""
+    """Pobiera listę dni ze specjalnymi godzinami otwarcia (z automatycznym czyszczeniem > 3 mies.)."""
     franchise_code = current_user.get("franchise_code")
+    await _cleanup_old_special_hours(db, franchise_code)
     hours = await db.specialopeninghours.find({"franchise_code": franchise_code}).to_list(length=None)
     
     # Fix dates/times for Pydantic
     for h in hours:
         if isinstance(h.get("date"), datetime):
             h["date"] = h["date"].date()
+        if h.get("is_closed") and not h.get("open_time"):
+            h["open_time"] = "00:00"
+        if h.get("is_closed") and not h.get("close_time"):
+            h["close_time"] = "00:00"
             
     return hours
 
@@ -162,6 +181,12 @@ async def update_special_hours(
         # Ale jsonable_encoder zamienia date na string 'YYYY-MM-DD', a my chcemy datetime w bazie dla zapytań
         # Wróćmy do datetime dla pola 'date'
         item_dict["date"] = datetime.combine(item.date, datetime.min.time())
+        if item.is_closed or not item.open_time or not item.close_time:
+            item_dict["is_closed"] = True
+            item_dict["open_time"] = "00:00"
+            item_dict["close_time"] = "00:00"
+        else:
+            item_dict["is_closed"] = False
         
         await db.specialopeninghours.update_one(
             {"franchise_code": franchise_code, "date": item_dict["date"]},

@@ -29,6 +29,7 @@ STATUTORY_COMMERCIAL_SUNDAYS = {
 }
 
 logger = logging.getLogger(__name__)
+PROMO_REFERENCE_DATE = date(2025, 9, 23)
 
 def json_converter(o):
     if isinstance(o, ObjectId):
@@ -39,7 +40,17 @@ def json_converter(o):
 
 async def get_store_settings_and_holidays(db: motor.motor_asyncio.AsyncIOMotorDatabase, franchise_code: str):
     store_settings = await db.storesettings.find_one({"franchise_code": franchise_code})
-    
+
+    cutoff_dt = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=90)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d")
+    await db.specialopeninghours.delete_many({
+        "franchise_code": franchise_code,
+        "$or": [
+            {"date": {"$lt": cutoff_dt}},
+            {"date": {"$type": "string", "$lt": cutoff_str}}
+        ]
+    })
+
     special_hours_cursor = db.specialopeninghours.find({"franchise_code": franchise_code})
     special_hours_list = await special_hours_cursor.to_list(length=None)
     
@@ -143,9 +154,16 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
     default_shifts = {
         "morning": ("06:00", "14:30"),
         "middle": ("10:00", "18:00"),
-        "closing": ("14:30", "23:00")
+        "closing": ("14:30", "23:00"),
+        "promo": ("14:30", "23:00")
     }
-    
+
+    is_promo_change_day = (date_obj - PROMO_REFERENCE_DATE).days % 14 == 0
+    if s_type == "closing" and is_promo_change_day and isinstance(shift_hours.get("promo"), dict):
+        promo_cfg = shift_hours.get("promo", {})
+        if promo_cfg.get("start_time") and promo_cfg.get("end_time"):
+            s_type = "promo"
+
     shift_setting = shift_hours.get(s_type, {})
     std_start_str = shift_setting.get("start_time", default_shifts.get(s_type, ("06:00", "14:30"))[0])
     std_end_str = shift_setting.get("end_time", default_shifts.get(s_type, ("06:00", "14:30"))[1])

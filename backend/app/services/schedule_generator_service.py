@@ -546,10 +546,16 @@ class ScheduleGenerator:
         if emp.target_hours <= 0:
             return 0.0
         if emp.is_uop:
-            return emp.target_hours
+            uop_pct = float(self.store_settings.get("uop_overtime_percent") or 0)
+            return emp.target_hours * (1.0 + uop_pct / 100.0)
         if emp.is_franchisee:
             return emp.target_hours * 1.1
-        return emp.target_hours * 1.5
+        uz_pct_raw = self.store_settings.get("uz_overtime_percent")
+        if uz_pct_raw is None:
+            uz_pct = 50.0 if self.store_settings.get("allow_overtime", True) else 0.0
+        else:
+            uz_pct = float(uz_pct_raw)
+        return emp.target_hours * (1.0 + uz_pct / 100.0)
 
     def _assign(self, emp: Employee, shift: ShiftDemand):
         emp.assigned_shifts.append(shift)
@@ -623,8 +629,8 @@ class ScheduleGenerator:
             elif shift.shift_type == schemas.ShiftType.MIDDLE.value:
                 score += 50.0
 
-        # 6. Preferuj nieprzekraczanie bazowego celu godzinowego dla UZ (bufor +50% tylko w razie potrzeby)
-        if not emp.is_uop and not emp.is_franchisee and emp.target_hours > 0:
+        # 6. Preferuj nieprzekraczanie bazowego celu godzinowego (bufor nadgodzin tylko w razie potrzeby)
+        if not emp.is_franchisee and emp.target_hours > 0:
             projected_ratio = (emp.worked_hours + shift.time_range.hours) / emp.target_hours
             if projected_ratio > 1.0:
                 score -= (projected_ratio - 1.0) * 100.0
@@ -748,9 +754,9 @@ class ScheduleGenerator:
                     if can_work and e.target_hours <= 0:
                         can_work = False
 
-                    # Dla umowy zlecenie nawet w fallbacku respektuj maksymalny odchył +50%
+                    # Dla umowy zlecenie nawet w fallbacku respektuj skonfigurowany próg nadgodzin (0/25/50/60%)
                     if can_work and not e.is_uop and not e.is_franchisee:
-                        if round(e.worked_hours + shift.time_range.hours, 2) > round(e.target_hours * 1.5, 2):
+                        if round(e.worked_hours + shift.time_range.hours, 2) > round(self._get_max_hours(e), 2):
                             can_work = False
                             
                     if can_work:

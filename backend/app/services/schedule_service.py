@@ -94,6 +94,17 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
     if s_type == "mid": s_type = "middle"
     if s_type == "m": s_type = "middle"
 
+    # Zmiana promocji zawsze korzysta z godzin wybranych przez franczyzobiorcę (chyba że sklep nieczynny w święto)
+    if s_type == "promo":
+        if date_str in holidays_map and holidays_map[date_str].get("is_closed"):
+            return ("00:00", "00:00")
+        promo_setting = shift_hours.get("promo", {})
+        p_start = promo_setting.get("start_time", "14:30")
+        p_end = promo_setting.get("end_time", "23:00")
+        if isinstance(p_start, time): p_start = p_start.strftime("%H:%M")
+        if isinstance(p_end, time): p_end = p_end.strftime("%H:%M")
+        return (p_start, p_end)
+
     # Logika dla dni specjalnych (święta) i niedziel
     special_day = False
     open_time_str, close_time_str = None, None
@@ -157,12 +168,6 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
         "closing": ("14:30", "23:00"),
         "promo": ("14:30", "23:00")
     }
-
-    is_promo_change_day = (date_obj - PROMO_REFERENCE_DATE).days % 14 == 0
-    if s_type == "closing" and is_promo_change_day and isinstance(shift_hours.get("promo"), dict):
-        promo_cfg = shift_hours.get("promo", {})
-        if promo_cfg.get("start_time") and promo_cfg.get("end_time"):
-            s_type = "promo"
 
     shift_setting = shift_hours.get(s_type, {})
     std_start_str = shift_setting.get("start_time", default_shifts.get(s_type, ("06:00", "14:30"))[0])
@@ -793,7 +798,7 @@ async def add_shift_to_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabase, sc
         pull_filters.extend([{"id": user_oid}, {"_id": user_oid}, user_oid])
 
     # Usuń ewentualne stare przypisanie tego pracownika w tym dniu
-    for k in ["morning", "mid", "middle", "closing", shift_key]:
+    for k in ["morning", "mid", "middle", "closing", "promo", shift_key]:
         for pf in pull_filters:
             await collection.update_one(
                 {"_id": sched_id},

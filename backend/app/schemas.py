@@ -70,6 +70,7 @@ class ShiftType(str, Enum):
     MORNING = "morning"
     MIDDLE = "middle"
     CLOSING = "closing"
+    PROMO = "promo"
 
 class DayPreference(str, Enum):
     WEEKDAYS = "pn-pt"
@@ -388,7 +389,8 @@ class UserPreferences(BaseModel):
         mapping = {
             ShiftType.MORNING: "Ranki",
             ShiftType.MIDDLE: "Środek",
-            ShiftType.CLOSING: "Zamknięcia"
+            ShiftType.CLOSING: "Zamknięcia",
+            ShiftType.PROMO: "Promocja"
         }
         return [mapping.get(shift, shift.value) for shift in v]
 

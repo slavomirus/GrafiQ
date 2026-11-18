@@ -47,18 +47,18 @@ class ScheduleValidator:
         if shifts_today:
             return False, "Pracownik ma już przypisaną zmianę w tym dniu."
 
-        # HC2: Przerwa dobowa (>= 12h)
+        # HC2: Przerwa dobowa (>= 11h)
         # HC6: Konflikt Otwarcie/Zamknięcie (częściowo pokryte przez HC2, ale sprawdzamy explicite)
         if not self._check_rest_period(shift_date, start_time, end_time, surrounding_shifts):
-            return False, "Naruszenie odpoczynku dobowego (min. 12h) lub konflikt zmian."
+            return False, "Naruszenie odpoczynku dobowego (min. 11h) lub konflikt zmian."
 
         # HC3: Maksymalna liczba dni pracujących z rzędu (<= 5)
         if not await self._check_consecutive_days(user_id, shift_date, franchise_code, ignore_shift_id):
             return False, "Przekroczono limit 5 dni pracy z rzędu."
 
-        # HC4: Tygodniowy odpoczynek (35h)
+        # HC4: Tygodniowy odpoczynek (36h)
         if not await self._check_weekly_rest(user_id, shift_date, start_time, end_time, franchise_code, ignore_shift_id):
-             return False, "Brak wymaganego 35h nieprzerwanego odpoczynku w tygodniu."
+             return False, "Brak wymaganego 36h nieprzerwanego odpoczynku w tygodniu."
 
         return True, None
 
@@ -74,11 +74,14 @@ class ScheduleValidator:
         # Dane zmiany requestera (którą oddaje)
         date1 = swap_request["my_date"]
         if isinstance(date1, datetime): date1 = date1.date()
+        req_filter = self._user_id_filter(requester_id)
+        s1_name = swap_request["my_shift_name"]
+        s1_name_filter = {"$in": ["mid", "middle"]} if s1_name in ["mid", "middle"] else s1_name
         shift1_doc = await self.db.schedule.find_one({
             "franchise_code": franchise_code,
-            "user_id": requester_id,
+            "user_id": req_filter,
             "date": datetime.combine(date1, time.min),
-            "shift_name": swap_request["my_shift_name"]
+            "shift_name": s1_name_filter
         })
         if not shift1_doc: return False, "Nie znaleziono zmiany inicjatora."
         
@@ -127,6 +130,13 @@ class ScheduleValidator:
 
     # --- Helper Methods ---
 
+    def _user_id_filter(self, user_id) -> dict:
+        if isinstance(user_id, ObjectId):
+            return {"$in": [user_id, str(user_id)]}
+        if ObjectId.is_valid(str(user_id)):
+            return {"$in": [ObjectId(str(user_id)), str(user_id)]}
+        return {"$in": [str(user_id)]}
+
     def _parse_time(self, t) -> time:
         if isinstance(t, time): return t
         if isinstance(t, datetime): return t.time()
@@ -174,7 +184,7 @@ class ScheduleValidator:
         
         cursor = self.db.schedule.find({
             "franchise_code": franchise_code,
-            "user_id": user_id,
+            "user_id": self._user_id_filter(user_id),
             "date": {"$gte": start, "$lte": end}
         })
         return await cursor.to_list(length=None)
@@ -195,16 +205,20 @@ class ScheduleValidator:
             if s_end_dt < s_start_dt:
                 s_end_dt += timedelta(days=1)
 
-            # Sprawdź odstęp
+            # Sprawdź nakładanie się zmian
+            if current_start_dt < s_end_dt and s_start_dt < current_end_dt:
+                return False
+
+            # Sprawdź odstęp (min. 11h odpoczynku dobowego)
             # Jeśli badana zmiana jest PO tej z bazy (np. dzisiaj vs wczoraj)
-            if current_start_dt > s_end_dt:
+            if current_start_dt >= s_end_dt:
                 diff = (current_start_dt - s_end_dt).total_seconds() / 3600.0
-                if diff < 12: return False
+                if diff < 11: return False
             
             # Jeśli badana zmiana jest PRZED tą z bazy (np. dzisiaj vs jutro)
-            if s_start_dt > current_end_dt:
+            if s_start_dt >= current_end_dt:
                 diff = (s_start_dt - current_end_dt).total_seconds() / 3600.0
-                if diff < 12: return False
+                if diff < 11: return False
                 
         return True
 
@@ -215,7 +229,7 @@ class ScheduleValidator:
         
         shifts = await self.db.schedule.find({
             "franchise_code": franchise_code,
-            "user_id": user_id,
+            "user_id": self._user_id_filter(user_id),
             "date": {"$gte": start_range, "$lte": end_range}
         }).to_list(length=None)
         
@@ -252,7 +266,7 @@ class ScheduleValidator:
         
         shifts = await self.db.schedule.find({
             "franchise_code": franchise_code,
-            "user_id": user_id,
+            "user_id": self._user_id_filter(user_id),
             "date": {"$gte": start_dt, "$lte": end_dt}
         }).sort("date", 1).to_list(length=None)
         
@@ -322,4 +336,4 @@ class ScheduleValidator:
             # Brak zmian w tygodniu = cały tydzień wolny
             max_gap = 24 * 7
             
-        return max_gap >= 35
+        return max_gap >= 36

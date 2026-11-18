@@ -278,21 +278,33 @@ async def offer_shift(
     franchise_code = current_user.get("franchise_code")
     requester_oid = ObjectId(requester_id) if not isinstance(requester_id, ObjectId) else requester_id
 
+    shift_name_filter = {"$in": ["mid", "middle"]} if request.my_shift_name in ["mid", "middle"] else request.my_shift_name
     requester_shift = await db.schedule.find_one({
         "franchise_code": franchise_code,
         "user_id": requester_oid,
         "date": datetime.combine(request.my_date, time.min),
-        "shift_name": request.my_shift_name
+        "shift_name": shift_name_filter
     })
     
     if not requester_shift:
         raise HTTPException(status_code=404, detail="Nie znaleziono Twojej zmiany w podanym dniu.")
+
+    actual_shift_name = requester_shift["shift_name"]
+    existing_offer = await db.shift_swaps.find_one({
+        "franchise_code": franchise_code,
+        "requester_id": {"$in": [requester_oid, str(requester_oid)]},
+        "my_date": datetime.combine(request.my_date, time.min),
+        "my_shift_name": actual_shift_name,
+        "status": {"$in": [schemas.SwapStatus.AVAILABLE.value, schemas.SwapStatus.PENDING_APPROVAL.value]}
+    })
+    if existing_offer:
+        raise HTTPException(status_code=400, detail="Ta zmiana jest już wystawiona na giełdzie.")
         
     swap_doc = {
         "requester_id": requester_id,
         "franchise_code": franchise_code,
         "my_date": datetime.combine(request.my_date, time.min),
-        "my_shift_name": request.my_shift_name,
+        "my_shift_name": actual_shift_name,
         "status": schemas.SwapStatus.AVAILABLE.value,
         "created_at": datetime.utcnow()
     }

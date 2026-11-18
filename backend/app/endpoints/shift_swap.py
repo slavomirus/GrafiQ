@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List
+from datetime import datetime, date, time
 from bson import ObjectId
 import logging
 import motor.motor_asyncio
@@ -8,6 +9,7 @@ from ..database import get_db
 from ..dependencies import get_current_active_user, get_current_admin_user
 from .. import models, schemas
 from ..services.shift_swap_service import create_swap_request, respond_to_swap, offer_shift, take_shift, approve_marketplace_claim
+from ..services.validator_service import ScheduleValidator
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -47,23 +49,43 @@ async def get_available_shifts(
     current_user: dict = Depends(get_current_active_user),
     db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
 ):
-    """Giełda Zmian: Pobierz dostępne zmiany do wzięcia."""
+    """Giełda Zmian: Pobierz dostępne zmiany do wzięcia (odfiltrowane o twarde ograniczenia pracownika)."""
     franchise_code = current_user.get("franchise_code")
+    today_dt = datetime.combine(date.today(), time.min)
+    user_oid = current_user["_id"] if isinstance(current_user["_id"], ObjectId) else ObjectId(str(current_user["_id"]))
     swaps = await db.shift_swaps.find({
         "franchise_code": franchise_code,
         "status": schemas.SwapStatus.AVAILABLE.value,
-        "requester_id": {"$ne": current_user["_id"]}
+        "requester_id": {"$nin": [user_oid, str(user_oid)]},
+        "my_date": {"$gte": today_dt}
     }).sort("created_at", -1).to_list(length=None)
     
+    validator = ScheduleValidator(db)
+    eligible_swaps = []
     for s in swaps:
-        s["my_date"] = s["my_date"].date()
+        swap_check = {
+            "requester_id": s["requester_id"],
+            "target_user_id": user_oid,
+            "franchise_code": franchise_code,
+            "my_date": s["my_date"].date() if isinstance(s["my_date"], datetime) else s["my_date"],
+            "my_shift_name": s["my_shift_name"],
+            "target_date": s["my_date"].date() if isinstance(s["my_date"], datetime) else s["my_date"],
+            "target_shift_name": "none"
+        }
+        is_valid, _ = await validator.validate_swap(swap_check)
+        if not is_valid:
+            continue
+
+        s["my_date"] = s["my_date"].date() if isinstance(s["my_date"], datetime) else s["my_date"]
         if s.get("target_date"):
-            s["target_date"] = s["target_date"].date()
-        u = await db.users.find_one({"_id": s["requester_id"]})
+            s["target_date"] = s["target_date"].date() if isinstance(s["target_date"], datetime) else s["target_date"]
+        req_oid = s["requester_id"] if isinstance(s["requester_id"], ObjectId) else ObjectId(str(s["requester_id"]))
+        u = await db.users.find_one({"_id": req_oid})
         if u:
             s["requester_name"] = f"{u.get('first_name', '')} {u.get('last_name', '')}"
+        eligible_swaps.append(s)
             
-    return swaps
+    return eligible_swaps
 
 @router.post("/{swap_id}/take", response_model=schemas.MessageResponse)
 async def take_shift_endpoint(

@@ -225,7 +225,7 @@ class ScheduleGenerator:
             prev_day_data = self.db_prev_schedule.get("schedule", {}).get(prev_date_str, {})
             
             for shift_type, shift_info in prev_day_data.items():
-                if shift_type in ["morning", "middle", "closing"] and isinstance(shift_info, dict):
+                if shift_type in ["morning", "middle", "closing", "promo"] and isinstance(shift_info, dict):
                     start_str = shift_info.get("start_time", "")
                     end_str = shift_info.get("end_time", "")
                     if not start_str or not end_str: continue
@@ -346,7 +346,8 @@ class ScheduleGenerator:
                 continue
 
             is_promo_change_day = (curr - PROMO_REFERENCE_DATE).days % 14 == 0
-            closing_needs = self.store_settings.get("employees_on_promo_change", 2) if is_promo_change_day else self.store_settings.get("employees_per_closing_shift", 1)
+            closing_needs = self.store_settings.get("employees_per_closing_shift", 1)
+            promo_needs = int(self.store_settings.get("employees_on_promo_change", 2)) if is_promo_change_day else 0
             
             is_sunday = curr.weekday() == 6
             opening_hours = self.store_settings.get("opening_hours", {})
@@ -361,7 +362,8 @@ class ScheduleGenerator:
             needs = {
                 schemas.ShiftType.MORNING.value: max(1, int(self.store_settings.get("employees_per_morning_shift", 1))),
                 schemas.ShiftType.MIDDLE.value: max(0, middle_count),
-                schemas.ShiftType.CLOSING.value: max(1, int(closing_needs))
+                schemas.ShiftType.CLOSING.value: max(1, int(closing_needs)),
+                schemas.ShiftType.PROMO.value: max(0, promo_needs)
             }
 
             for shift_name, count in needs.items():
@@ -789,7 +791,7 @@ class ScheduleGenerator:
                 curr += timedelta(days=1)
                 continue
             
-            for shift_type in [schemas.ShiftType.MORNING.value, schemas.ShiftType.MIDDLE.value, schemas.ShiftType.CLOSING.value]:
+            for shift_type in [schemas.ShiftType.MORNING.value, schemas.ShiftType.MIDDLE.value, schemas.ShiftType.CLOSING.value, schemas.ShiftType.PROMO.value]:
                 emp_list = []
                 for emp in self.employees:
                     for assigned in emp.assigned_shifts:

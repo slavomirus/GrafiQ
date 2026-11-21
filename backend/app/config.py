@@ -2,6 +2,7 @@ from pydantic_settings import BaseSettings
 from functools import lru_cache
 import logging
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -14,10 +15,14 @@ class Settings(BaseSettings):
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+    FIELD_ENCRYPTION_KEY: Optional[str] = None
+    SENTRY_DSN: Optional[str] = None
 
     # Wersje dokumentów
     EULA_VERSION: str = "1.0"
     RODO_VERSION: str = "1.0"
+    DPA_VERSION: str = "1.0"
 
     # MAIL
     MAIL_USERNAME: str

@@ -88,6 +88,10 @@ class DatabaseManager:
             await self.db.vacations.create_index([("user_id", 1)])
             await self.db.vacations.create_index([("status", 1)])
             await self.db.schedule.create_index([("user_id", 1)])
+            await self.db.schedule.create_index([("franchise_code", 1), ("date", 1)])
+            await self.db.schedules.create_index([("franchise_code", 1), ("start_date", 1), ("end_date", 1)])
+            await self.db.shift_swaps.create_index([("franchise_code", 1), ("status", 1), ("my_date", 1)])
+            await self.db.audit_logs.create_index([("franchise_code", 1), ("timestamp", -1)])
             # await self.db.schedule.create_index([("date", 1)]) # USUNIĘTE - teraz to TTL
             await self.db.availabilities.create_index([("user_id", 1)])
             # await self.db.availabilities.create_index([("date", 1)]) # USUNIĘTE - teraz to TTL

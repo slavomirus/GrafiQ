@@ -12,18 +12,55 @@ from .. import models, schemas, security
 from ..email_service import send_verification_code_email, send_otp_email
 from ..dependencies import get_current_user
 from ..config import settings
+from ..services.audit_service import log_audit_event, extract_client_ip
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Ochrona przed Brute-Force per konto (nie per IP proxy), 5 prób -> blokada na 15 minut
+MAX_FAILED_LOGINS = 5
+LOCKOUT_MINUTES = 15
+_LOGIN_FAILURES: dict = {}
+
+
+def _check_account_lockout(identifier: str):
+    key = identifier.strip().lower()
+    rec = _LOGIN_FAILURES.get(key)
+    if not rec:
+        return
+    locked_until = rec.get("locked_until")
+    if locked_until and datetime.utcnow() < locked_until:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Zbyt wiele nieudanych prób logowania. Konto tymczasowo zablokowane na 15 minut."
+        )
+    if locked_until and datetime.utcnow() >= locked_until:
+        _LOGIN_FAILURES.pop(key, None)
+
+
+def _record_failed_login(identifier: str) -> bool:
+    key = identifier.strip().lower()
+    rec = _LOGIN_FAILURES.get(key, {"count": 0, "locked_until": None})
+    rec["count"] += 1
+    locked_now = False
+    if rec["count"] >= MAX_FAILED_LOGINS:
+        rec["locked_until"] = datetime.utcnow() + timedelta(minutes=LOCKOUT_MINUTES)
+        locked_now = True
+    _LOGIN_FAILURES[key] = rec
+    return locked_now
+
+
+def _clear_failed_logins(identifier: str):
+    _LOGIN_FAILURES.pop(identifier.strip().lower(), None)
 
 
 @router.post("/register/franchisee", response_model=schemas.RegistrationResponse)
 async def register_franchisee(user: schemas.UserCreateFranchisee,
                               request: Request,
                               db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)):
-    # Walidacja zgód
-    if not user.acceptEula or not user.acceptRodo:
-        raise HTTPException(status_code=400, detail="Akceptacja EULA i RODO jest wymagana do założenia konta")
+    # Walidacja zgód (EULA, RODO, DPA)
+    if not user.acceptEula or not user.acceptRodo or not user.acceptDpa:
+        raise HTTPException(status_code=400, detail="Akceptacja EULA, RODO oraz umowy powierzenia (DPA) jest wymagana do założenia konta")
 
     # Sanityzacja kodu franczyzy (usuwanie spacji)
     clean_franchise_code = user.franchise_code.strip()
@@ -62,7 +99,8 @@ async def register_franchisee(user: schemas.UserCreateFranchisee,
     agreements_data = {
         "eula": {"acceptedAt": now, "version": settings.EULA_VERSION},
         "rodo": {"acceptedAt": now, "version": settings.RODO_VERSION},
-        "ipAddress": request.client.host
+        "dpa": {"acceptedAt": now, "version": settings.DPA_VERSION},
+        "ipAddress": extract_client_ip(request)
     }
 
     new_user_data = {
@@ -157,6 +195,7 @@ async def login_for_access_token(login_data: schemas.LoginRequest,
                                  request: Request = None,
                                  db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)):
     login_identifier = login_data.email
+    _check_account_lockout(login_identifier)
     
     if "@" in login_identifier:
         user = await db.users.find_one({"email": login_identifier})
@@ -164,11 +203,22 @@ async def login_for_access_token(login_data: schemas.LoginRequest,
         user = await db.users.find_one({"username": login_identifier})
 
     if not user or not security.verify_password(login_data.password, user.get("hashed_password", "")):
+        locked_now = _record_failed_login(login_identifier)
+        await log_audit_event(
+            db,
+            action="LOGIN_LOCKED" if locked_now else "LOGIN_FAILED",
+            user_id=str(user["_id"]) if user else None,
+            franchise_code=user.get("franchise_code") if user else None,
+            ip_address=extract_client_ip(request),
+            details={"identifier": login_identifier}
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Niepoprawny e-mail lub hasło.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    _clear_failed_logins(login_identifier)
 
     # Sprawdzanie wersji EULA
     requires_agreement_update = False
@@ -177,7 +227,8 @@ async def login_for_access_token(login_data: schemas.LoginRequest,
         if user_eula_version != settings.EULA_VERSION:
             requires_agreement_update = True
 
-    access_token = security.create_access_token(data={"sub": str(user["_id"])})
+    token_version = int(user.get("token_version", 0))
+    access_token = security.create_access_token(data={"sub": str(user["_id"]), "tv": token_version})
 
     if user.get("status") == "needs_password_change":
         return JSONResponse(
@@ -191,15 +242,102 @@ async def login_for_access_token(login_data: schemas.LoginRequest,
 
     if user.get("status") != models.UserStatus.ACTIVE.value:
         raise HTTPException(
-            status_code=status.HTTP_403,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail=f"User account is not active. Current status: {user.get('status')}",
         )
 
+    refresh_token = security.create_refresh_token(data={"sub": str(user["_id"]), "tv": token_version})
+    refresh_payload = security.decode_token(refresh_token) or {}
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"active_refresh_jti": refresh_payload.get("jti")}}
+    )
+
     return {
         "access_token": access_token, 
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "requires_agreement_update": requires_agreement_update
     }
+
+
+@router.post("/refresh", response_model=schemas.Token)
+async def refresh_access_token(
+    refresh_req: schemas.RefreshTokenRequest,
+    request: Request = None,
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+):
+    """Rotacja Refresh Tokena i wystawienie nowego Access Tokena."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Nieprawidłowy lub wygasły token odświeżania.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    payload = security.decode_token(refresh_req.refresh_token)
+    if not payload or payload.get("type") != "refresh":
+        raise credentials_exception
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise credentials_exception
+
+    from bson import ObjectId
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user or user.get("status") != models.UserStatus.ACTIVE.value:
+        raise credentials_exception
+
+    if int(payload.get("tv", 0)) != int(user.get("token_version", 0)):
+        raise credentials_exception
+
+    if user.get("active_refresh_jti") and payload.get("jti") != user.get("active_refresh_jti"):
+        # Wykryto próbę ponownego użycia zrotowanego refresh tokena -> unieważnij wszystkie sesje
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$inc": {"token_version": 1}, "$unset": {"active_refresh_jti": ""}}
+        )
+        await log_audit_event(
+            db,
+            action="REFRESH_TOKEN_REUSE_DETECTED",
+            user_id=user_id,
+            franchise_code=user.get("franchise_code"),
+            ip_address=extract_client_ip(request),
+        )
+        raise credentials_exception
+
+    token_version = int(user.get("token_version", 0))
+    new_access = security.create_access_token(data={"sub": user_id, "tv": token_version})
+    new_refresh = security.create_refresh_token(data={"sub": user_id, "tv": token_version})
+    new_refresh_payload = security.decode_token(new_refresh) or {}
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"active_refresh_jti": new_refresh_payload.get("jti")}}
+    )
+    return {
+        "access_token": new_access,
+        "refresh_token": new_refresh,
+        "token_type": "bearer",
+    }
+
+
+@router.post("/revoke-sessions", response_model=schemas.MessageResponse)
+async def revoke_all_sessions(
+    request: Request = None,
+    current_user: dict = Depends(get_current_user),
+    db: motor.motor_asyncio.AsyncIOMotorClient = Depends(get_db)
+):
+    """Zdalne unieważnienie wszystkich aktywnych sesji użytkownika."""
+    await db.users.update_one(
+        {"_id": current_user["_id"]},
+        {"$inc": {"token_version": 1}, "$unset": {"active_refresh_jti": ""}}
+    )
+    await log_audit_event(
+        db,
+        action="SESSIONS_REVOKED",
+        user_id=str(current_user["_id"]),
+        franchise_code=current_user.get("franchise_code"),
+        ip_address=extract_client_ip(request),
+    )
+    return {"message": "Wszystkie aktywne sesje zostały unieważnione."}
 
 
 @router.post("/set-new-password", response_model=schemas.Token)

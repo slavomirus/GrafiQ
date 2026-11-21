@@ -417,6 +417,7 @@ class UserCreateFranchisee(UserBase):
     referral_code: Optional[str] = None
     acceptEula: bool
     acceptRodo: bool
+    acceptDpa: bool = True
 
 
 class UserCreateByAdmin(UserBase):
@@ -486,6 +487,10 @@ class LoginRequest(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    refresh_token: Optional[str] = None
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
 
 class LoginResponse(Token):
     requires_agreement_update: Optional[bool] = False

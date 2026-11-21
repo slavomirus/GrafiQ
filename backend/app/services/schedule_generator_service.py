@@ -498,7 +498,8 @@ class ScheduleGenerator:
         
         return True
 
-    def _check_hard_constraints(self, emp: Employee, shift: ShiftDemand) -> bool:
+    def _check_non_hour_constraints(self, emp: Employee, shift: ShiftDemand) -> bool:
+        """Sprawdza wszystkie twarde reguły Kodeksu Pracy poza limitem godzin."""
         for unav in emp.unavailabilities:
             if unav.overlaps(shift.time_range):
                 return False
@@ -534,7 +535,13 @@ class ScheduleGenerator:
             if not self._check_weekly_rest(emp, shift):
                 return False
 
-        # Limity godzin: UOP = 100% (Art. 130 KP), Franczyzobiorca = +10%, UZ = +50% (odchył +/- 50%)
+        return True
+
+    def _check_hard_constraints(self, emp: Employee, shift: ShiftDemand) -> bool:
+        if not self._check_non_hour_constraints(emp, shift):
+            return False
+
+        # Limity godzin: UOP = 100% (Art. 130 KP) + opcjonalne nadgodziny, Franczyzobiorca = +10%, UZ = próg %
         max_hours = self._get_max_hours(emp)
         if max_hours <= 0 and shift.time_range.hours > 0:
             return False
@@ -636,6 +643,11 @@ class ScheduleGenerator:
             projected_ratio = (emp.worked_hours + shift.time_range.hours) / emp.target_hours
             if projected_ratio > 1.0:
                 score -= (projected_ratio - 1.0) * 100.0
+
+        # 7. Równomierne obciążenie zespołu (Load Balancing) — priorytet dla osób z niższym % realizacji normy
+        if emp.target_hours > 0:
+            burn_rate = emp.worked_hours / emp.target_hours
+            score += (1.0 - burn_rate) * 150.0
 
         return score
 
@@ -778,6 +790,9 @@ class ScheduleGenerator:
                     date_str = shift.time_range.start.strftime("%Y-%m-%d")
                     self.logs.append(f"[KRYTYCZNE - FATAL] Nie można obsadzić zmiany '{shift.shift_type}' w dniu {date_str} – brak dostępnego personelu (wszyscy zablokowani twardymi ograniczeniami/urlopami).")
 
+        # KROK 6: Wyrównanie godzin UOP (przeniesienie zmian z osób powyżej normy/wyższym % na osoby poniżej normy)
+        self._rebalance_uop_hours(start_date, end_date)
+
         # Mapowanie z powrotem do docelowego formatu JSON
         final_schedule_for_json = {}
         curr = start_date
@@ -843,6 +858,68 @@ class ScheduleGenerator:
         }
         result = await self.db.schedule_drafts.insert_one(draft_document)
         logger.info(f"Zapisano nowy grafik roboczy z architekturą Dataclass dla {self.franchise_code} z ID: {result.inserted_id}")
+
+    def _check_rebalance_fallback_constraints(self, emp: Employee, shift: ShiftDemand) -> bool:
+        """Sprawdza podstawowe bezpieczeństwo (urlopy, 1 zmiana/dzień, 11h odpoczynku, max 6 dni) przy wyrównywaniu po KROKU 5."""
+        for unav in emp.unavailabilities:
+            if unav.overlaps(shift.time_range):
+                return False
+        for assigned in emp.assigned_shifts:
+            if assigned.time_range.overlaps(shift.time_range):
+                return False
+            if assigned.time_range.start.date() == shift.time_range.start.date():
+                return False
+            if assigned.time_range.end <= shift.time_range.start:
+                if (shift.time_range.start - assigned.time_range.end).total_seconds() / 3600.0 < 11.0:
+                    return False
+            elif shift.time_range.end <= assigned.time_range.start:
+                if (assigned.time_range.start - shift.time_range.end).total_seconds() / 3600.0 < 11.0:
+                    return False
+        if self._count_consecutive_days(emp, shift.time_range.start.date()) > 6:
+            return False
+        return True
+
+    def _rebalance_uop_hours(self, start_date: date, end_date: date):
+        """Przenosi zmiany od pracowników UOP z nadmiarem godzin do pracowników UOP poniżej celu."""
+        uop_emps = [e for e in self.employees if e.is_uop and e.target_hours > 0]
+        if len(uop_emps) < 2:
+            return
+
+        for _ in range(50):
+            moved = False
+            uop_emps.sort(key=lambda e: e.worked_hours / e.target_hours)
+            under = uop_emps[0]
+            over = uop_emps[-1]
+            if (over.worked_hours / over.target_hours) - (under.worked_hours / under.target_hours) <= 0.04:
+                break
+
+            for strict_kp in (True, False):
+                if not strict_kp and not (over.worked_hours > over.target_hours and under.worked_hours < under.target_hours):
+                    continue
+                for shift in list(over.assigned_shifts):
+                    if shift.id.startswith("prev_"):
+                        continue
+                    s_date = shift.time_range.start.date()
+                    if not (start_date <= s_date <= end_date):
+                        continue
+                    s_hrs = shift.time_range.hours
+                    if round(under.worked_hours + s_hrs, 2) > round(self._get_max_hours(under), 2):
+                        continue
+                    if (over.worked_hours - s_hrs) / over.target_hours < (under.worked_hours + s_hrs) / under.target_hours - 0.01:
+                        continue
+                    ok = self._check_non_hour_constraints(under, shift) if strict_kp else self._check_rebalance_fallback_constraints(under, shift)
+                    if ok:
+                        over.assigned_shifts.remove(shift)
+                        over.worked_hours -= s_hrs
+                        under.assigned_shifts.append(shift)
+                        under.worked_hours += s_hrs
+                        moved = True
+                        break
+                if moved:
+                    break
+
+            if not moved:
+                break
 
 async def generate_schedule_for_period(db: motor.motor_asyncio.AsyncIOMotorDatabase, current_user: dict, year: int = None, month: int = None, start_date_str: str = None, end_date_str: str = None):
     franchise_code = current_user.get("franchise_code")

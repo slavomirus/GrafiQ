@@ -34,6 +34,10 @@ async def get_current_user(
             logger.warning("Authentication failed: Token decoding resulted in None payload.")
             raise credentials_exception
 
+        if payload.get("type", "access") != "access":
+            logger.warning("Authentication failed: Non-access token presented as access token.")
+            raise credentials_exception
+
         user_id: str = payload.get("sub")
         if user_id is None:
             logger.warning("Authentication failed: Token does not contain a 'sub' (subject) claim.")
@@ -42,6 +46,10 @@ async def get_current_user(
         user = await db.users.find_one({"_id": ObjectId(user_id)})
         if user is None:
             logger.warning(f"Authentication failed: User with ID '{user_id}' from token not found in database.")
+            raise credentials_exception
+
+        if int(payload.get("tv", 0)) != int(user.get("token_version", 0)):
+            logger.warning(f"Authentication failed: Revoked token version for user {user_id}.")
             raise credentials_exception
 
         # --- LOGIKA MULTI-STORE (Context Switching) ---

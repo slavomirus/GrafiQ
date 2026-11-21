@@ -32,10 +32,28 @@ root_logger.setLevel(logging.INFO)
 # ------------------------------
 
 from .database import db_manager
-from .endpoints import auth, vacation, availability, schedule, users, reports, verification, stores, schedule_generator, schedule_management, settings, shift_swap, updates, payments, webhooks
+from .config import settings
+from .endpoints import auth, vacation, availability, schedule, users, reports, verification, stores, schedule_generator, schedule_management, settings as settings_ep, shift_swap, updates, payments, webhooks
 from .services.seniority_service import update_employees_seniority
 
 logger = logging.getLogger(__name__)
+
+# Opcjonalna inicjalizacja Sentry z maskowaniem PII (gdy ustawiono SENTRY_DSN)
+if settings.SENTRY_DSN:
+    try:
+        import sentry_sdk
+        def _scrub_pii(event, hint):
+            req = event.get("request", {})
+            headers = req.get("headers", {})
+            if isinstance(headers, dict):
+                for h in list(headers.keys()):
+                    if h.lower() in {"authorization", "cookie", "x-api-key"}:
+                        headers[h] = "[REDACTED]"
+            return event
+        sentry_sdk.init(dsn=settings.SENTRY_DSN, traces_sample_rate=0.1, send_default_pii=False, before_send=_scrub_pii)
+        logger.info("Sentry SDK zainicjalizowany z PII scrubbing.")
+    except ImportError:
+        logger.warning("SENTRY_DSN ustawione, ale pakiet sentry-sdk nie jest zainstalowany.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -94,6 +112,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
+
 # --- Montowanie plików statycznych (EULA/RODO) ---
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if not os.path.exists(static_dir):
@@ -127,7 +154,7 @@ app.include_router(verification.router, prefix="/verification", tags=["verificat
 app.include_router(stores.router, prefix="/stores", tags=["stores"])
 app.include_router(schedule_generator.router, prefix="/schedule-generator", tags=["schedule-generator"])
 app.include_router(schedule_management.router, prefix="/schedule-management", tags=["schedule-management"])
-app.include_router(settings.router, prefix="/settings", tags=["settings"])
+app.include_router(settings_ep.router, prefix="/settings", tags=["settings"])
 app.include_router(shift_swap.router, prefix="/swaps", tags=["swaps"])
 app.include_router(updates.router, prefix="/updates", tags=["updates"])
 app.include_router(payments.router, prefix="/payments", tags=["payments"])

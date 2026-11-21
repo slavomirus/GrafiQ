@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from ..database import get_db
 from .. import models, schemas, crud
 from ..dependencies import get_current_active_user, get_current_admin_user
+from ..services.audit_service import log_audit_event, extract_client_ip
 from ..email_service import send_new_employee_credentials_email
 from ..services.schedule_replacement_service import find_best_solution_for_shift
 from ..services.vacation_service import calculate_vacation_days
@@ -445,6 +446,23 @@ async def get_my_profile(
         raise HTTPException(status_code=500, detail="Wystąpił błąd podczas pobierania profilu.")
 
 
+@router.get("/audit-logs")
+async def get_audit_logs(
+    limit: int = 100,
+    current_user: dict = Depends(get_current_admin_user),
+    db: motor.motor_asyncio.AsyncIOMotorDatabase = Depends(get_db)
+):
+    """Pobiera niezmienne logi audytowe wyłącznie dla aktywnego sklepu franczyzobiorcy."""
+    franchise_code = current_user.get("franchise_code")
+    cursor = db.audit_logs.find({"franchise_code": franchise_code}).sort("timestamp", -1).limit(min(limit, 500))
+    logs = await cursor.to_list(length=None)
+    for item in logs:
+        item["_id"] = str(item["_id"])
+        if isinstance(item.get("timestamp"), datetime):
+            item["timestamp"] = item["timestamp"].isoformat()
+    return logs
+
+
 @router.get("/{user_id}", response_model=schemas.UserResponse)
 async def get_user(
     user_id: str,
@@ -459,13 +477,17 @@ async def get_user(
         if not user_to_get:
             raise HTTPException(status_code=404, detail="Użytkownik nie znaleziony")
 
-        # Sprawdzenie, czy użytkownicy należą do tej samej franczyzy
-        is_same_franchise = current_user.get("franchise_code") == user_to_get.get("franchise_code")
+        # Multi-tenancy (ochrona IDOR): wymagaj przynależności do tej samej franczyzy (poza SuperAdminem)
+        is_superadmin = current_user.get("role") == models.UserRole.ADMIN.value
+        curr_franchises = set(current_user.get("franchise_codes") or [])
+        if current_user.get("franchise_code"):
+            curr_franchises.add(current_user.get("franchise_code"))
+        target_franchise = user_to_get.get("franchise_code")
+        is_same_franchise = bool(target_franchise and target_franchise in curr_franchises)
         is_admin_or_franchisee = current_user["role"] in [models.UserRole.ADMIN.value, models.UserRole.FRANCHISEE.value]
         is_getting_own_data = str(current_user["_id"]) == user_id
 
-        # Zezwól, jeśli admin/franczyzobiorca LUB użytkownicy są z tej samej franczyzy
-        if not (is_admin_or_franchisee or is_same_franchise):
+        if not (is_superadmin or is_same_franchise or is_getting_own_data):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Brak uprawnień do wyświetlenia danych tego użytkownika.")
 
         # Jeśli zwykły pracownik pyta o kogoś innego, zwróć tylko podstawowe dane
@@ -507,3 +529,48 @@ async def register_fcm_token(
     )
     
     return {"message": "Token FCM zarejestrowany."}
+
+
+@router.post("/{user_id}/anonymize", response_model=schemas.MessageResponse)
+async def anonymize_user_rodo(
+    user_id: str,
+    request: Request = None,
+    current_user: dict = Depends(get_current_admin_user),
+    db: motor.motor_asyncio.AsyncIOMotorDatabase = Depends(get_db)
+):
+    """RODO: Anonimizuje dane osobowe pracownika (prawo do bycia zapomnianym) i unieważnia jego sesje."""
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=400, detail="Nieprawidłowy identyfikator użytkownika.")
+    target_oid = ObjectId(user_id)
+    target = await db.users.find_one({"_id": target_oid})
+    if not target:
+        raise HTTPException(status_code=404, detail="Użytkownik nie znaleziony.")
+    if target.get("franchise_code") != current_user.get("franchise_code") and current_user.get("role") != models.UserRole.ADMIN.value:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Brak uprawnień do anonimizacji tego użytkownika.")
+
+    await db.users.update_one(
+        {"_id": target_oid},
+        {
+            "$set": {
+                "first_name": "Anonimowy",
+                "last_name": "Pracownik",
+                "email": f"anon_{user_id}@deleted.local",
+                "username": f"anon_{user_id}",
+                "phone": None,
+                "fcm_tokens": [],
+                "status": models.UserStatus.SUSPENDED.value,
+                "anonymized_at": datetime.utcnow(),
+            },
+            "$inc": {"token_version": 1},
+            "$unset": {"active_refresh_jti": ""},
+        }
+    )
+    await log_audit_event(
+        db,
+        action="USER_ANONYMIZED",
+        user_id=str(current_user["_id"]),
+        franchise_code=current_user.get("franchise_code"),
+        ip_address=extract_client_ip(request),
+        resource_id=user_id,
+    )
+    return {"message": "Dane pracownika zostały zanonimizowane zgodnie z RODO."}

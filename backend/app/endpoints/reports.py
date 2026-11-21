@@ -54,30 +54,39 @@ async def get_hours_report(
             }
         }
 
-        # Filtrowanie po user_id
+        # Filtrowanie po user_id (obsługa ObjectId i string)
         if user_id:
-            query["user_id"] = ObjectId(user_id)
+            if ObjectId.is_valid(user_id):
+                query["user_id"] = {"$in": [ObjectId(user_id), user_id]}
+            else:
+                query["user_id"] = user_id
 
         # Filtrowanie po franczyzie (jeśli nie podano konkretnego user_id lub jesteśmy adminem sklepu)
         if franchise_code and not user_id:
             franchise_users = await db.users.find({
-                "franchise_code": franchise_code,
+                "$or": [
+                    {"franchise_code": franchise_code},
+                    {"franchise_codes": franchise_code}
+                ],
                 "role": {"$in": [models.UserRole.EMPLOYEE.value, models.UserRole.FRANCHISEE.value]}
             }).to_list(length=None)
             franchise_user_ids = [user["_id"] for user in franchise_users]
-            query["user_id"] = {"$in": franchise_user_ids}
+            query["user_id"] = {"$in": franchise_user_ids + [str(uid) for uid in franchise_user_ids]}
+        elif franchise_code and user_id:
+            query["franchise_code"] = franchise_code
 
         # Pobranie grafików
         schedules = await db.schedule.find(query).to_list(length=None)
 
-        # Pobranie danych o użytkownikach
-        user_ids = list({s["user_id"] for s in schedules})
+        # Pobranie danych o użytkownikach (obsługa ObjectId i str)
+        raw_uids = {s["user_id"] for s in schedules if s.get("user_id") is not None}
+        user_ids = [ObjectId(str(uid)) if ObjectId.is_valid(str(uid)) else uid for uid in raw_uids]
         users = await db.users.find({"_id": {"$in": user_ids}}).to_list(length=None)
-        user_dict = {user["_id"]: user for user in users}
+        user_dict = {str(user["_id"]): user for user in users}
 
         report_data = []
         for s in schedules:
-            user_info = user_dict.get(s["user_id"])
+            user_info = user_dict.get(str(s.get("user_id")))
             if user_info:
                 # Use parse_time helper for robustness
                 start_time = parse_time(s.get('start_time'))
@@ -176,14 +185,15 @@ async def get_hours_report_pdf_endpoint(
         # Pobranie grafików
         schedules = await db.schedule.find(query).to_list(length=None)
 
-        # Pobranie danych o użytkownikach
-        user_ids = list({s["user_id"] for s in schedules})
+        # Pobranie danych o użytkownikach (obsługa ObjectId i str)
+        raw_uids = {s["user_id"] for s in schedules if s.get("user_id") is not None}
+        user_ids = [ObjectId(str(uid)) if ObjectId.is_valid(str(uid)) else uid for uid in raw_uids]
         users = await db.users.find({"_id": {"$in": user_ids}}).to_list(length=None)
-        user_dict = {user["_id"]: user for user in users}
+        user_dict = {str(user["_id"]): user for user in users}
 
         report_data = []
         for s in schedules:
-            user_info = user_dict.get(s["user_id"])
+            user_info = user_dict.get(str(s.get("user_id")))
             if user_info:
                 # Use helper function to parse time securely (handles HH:MM and HH:MM:SS)
                 s_start = parse_time(s.get('start_time'))

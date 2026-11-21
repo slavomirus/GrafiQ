@@ -645,7 +645,7 @@ class ScheduleGenerator:
         if not emp.is_franchisee and emp.target_hours > 0:
             projected_ratio = (emp.worked_hours + shift.time_range.hours) / emp.target_hours
             if projected_ratio > 1.0:
-                score -= (projected_ratio - 1.0) * 100.0
+                score -= 200.0 + (projected_ratio - 1.0) * 100.0
 
         # 7. Równomierne obciążenie zespołu (Load Balancing) — priorytet dla osób z niższym % realizacji normy
         if emp.target_hours > 0:

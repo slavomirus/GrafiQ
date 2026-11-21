@@ -35,6 +35,7 @@ from .database import db_manager
 from .config import settings
 from .endpoints import auth, vacation, availability, schedule, users, reports, verification, stores, schedule_generator, schedule_management, settings as settings_ep, shift_swap, updates, payments, webhooks
 from .services.seniority_service import update_employees_seniority
+from .services.notification_service import initialize_firebase
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ async def lifespan(app: FastAPI):
     Kontekst cyklu życia aplikacji do łączenia i zamykania bazy danych.
     """
     logger.info("Aplikacja startuje... Łączenie z bazą danych.")
+    initialize_firebase()
     await db_manager.connect_to_db()
     
     # Automatyczna aktualizacja stażu pracy przy starcie aplikacji

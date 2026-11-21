@@ -1,4 +1,5 @@
 import logging
+import json
 import firebase_admin
 from firebase_admin import credentials, messaging
 from typing import List, Optional
@@ -17,25 +18,36 @@ def initialize_firebase():
         return
 
     try:
-        # Szukamy pliku klucza w głównym katalogu lub w backend/
-        cred_path = "serviceAccountKey.json"
-        if not os.path.exists(cred_path):
-            cred_path = "backend/serviceAccountKey.json"
-            
-        if os.path.exists(cred_path):
-            cred = credentials.Certificate(cred_path)
-            # Sprawdź czy aplikacja już istnieje, żeby uniknąć błędu przy reloadzie
+        cred = None
+        env_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+        if env_json:
+            cred = credentials.Certificate(json.loads(env_json))
+            source_desc = "env:FIREBASE_CREDENTIALS_JSON"
+        else:
+            candidate_paths = [
+                "serviceAccountKey.json",
+                "backend/serviceAccountKey.json",
+                "/etc/secrets/serviceAccountKey.json",
+            ]
+            found_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+            if found_path:
+                cred = credentials.Certificate(found_path)
+                source_desc = found_path
+
+        if cred is not None:
             try:
                 firebase_admin.get_app()
             except ValueError:
                 firebase_admin.initialize_app(cred)
-            
             _firebase_initialized = True
-            logger.info("Firebase Admin SDK initialized successfully.")
+            logger.info(f"Firebase Admin SDK initialized successfully ({source_desc}).")
+            print(f"[Firebase] Admin SDK initialized successfully ({source_desc}).")
         else:
-            logger.warning(f"Firebase serviceAccountKey.json not found at {cred_path}. Push notifications will be disabled.")
+            logger.warning("Firebase serviceAccountKey.json not found in local paths or /etc/secrets/. Push notifications will be disabled.")
+            print("[Firebase] WARNING: serviceAccountKey.json not found (checked serviceAccountKey.json, backend/serviceAccountKey.json, /etc/secrets/serviceAccountKey.json).")
     except Exception as e:
         logger.error(f"Failed to initialize Firebase: {e}")
+        print(f"[Firebase] ERROR initializing Firebase: {e}")
 
 # Wywołaj przy imporcie (bezpieczne, bo sprawdza flagę)
 initialize_firebase()

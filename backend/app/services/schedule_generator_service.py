@@ -783,25 +783,24 @@ class ScheduleGenerator:
                     if can_work:
                         fallback_candidates.append(e)
                 
-                if fallback_candidates:
-                    within_limit = [
-                        e for e in fallback_candidates
-                        if round(e.worked_hours + shift.time_range.hours, 2) <= round(self._get_max_hours(e), 2)
-                    ]
-                    pool = within_limit if within_limit else fallback_candidates
-                    pool.sort(
+                within_limit = [
+                    e for e in fallback_candidates
+                    if round(e.worked_hours + shift.time_range.hours, 2) <= round(self._get_max_hours(e), 2)
+                ]
+                if within_limit:
+                    within_limit.sort(
                         key=lambda e: (
                             0 if e.worked_hours < e.target_hours else 1,
                             e.worked_hours / e.target_hours if e.target_hours > 0 else float("inf"),
                             e.worked_hours,
                         )
                     )
-                    chosen = pool[0]
+                    chosen = within_limit[0]
                     self._assign(chosen, shift)
-                    self.logs.append(f"[KRYTYCZNE - WYMUSZONO] Awaryjnie przypisano pracownika {chosen.first_name} {chosen.last_name} do zmiany '{shift.shift_type}' ({shift.time_range.start.date()}), ignorując docelowe czasy pracy.")
+                    self.logs.append(f"[KRYTYCZNE - WYMUSZONO] Awaryjnie przypisano pracownika {chosen.first_name} {chosen.last_name} do zmiany '{shift.shift_type}' ({shift.time_range.start.date()}), z zachowaniem limitu godzin.")
                 else:
                     date_str = shift.time_range.start.strftime("%Y-%m-%d")
-                    self.logs.append(f"[KRYTYCZNE - FATAL] Nie można obsadzić zmiany '{shift.shift_type}' w dniu {date_str} – brak dostępnego personelu (wszyscy zablokowani twardymi ograniczeniami/urlopami).")
+                    self.logs.append(f"[KRYTYCZNE - FATAL] Nie można obsadzić zmiany '{shift.shift_type}' w dniu {date_str} – brak dostępnego personelu w ramach limitów godzinowych (wszyscy zablokowani limitami/urlopami).")
 
         # KROK 6: Wyrównanie godzin UOP (przeniesienie zmian z osób powyżej normy/wyższym % na osoby poniżej normy)
         self._rebalance_uop_hours(start_date, end_date)

@@ -556,7 +556,10 @@ class ScheduleGenerator:
             return 0.0
         if emp.is_uop:
             uop_pct = float(self.store_settings.get("uop_overtime_percent") or 0)
-            return emp.target_hours * (1.0 + uop_pct / 100.0)
+            if uop_pct > 0:
+                return emp.target_hours * (1.0 + uop_pct / 100.0)
+            # Gdy brak nadgodzin %, dopuszczamy tolerancję +5h (np. dla zmian 8.5h), aby pracownik nie spadł poniżej etatu
+            return emp.target_hours + 5.0
         if emp.is_franchisee:
             return emp.target_hours * 1.1
         uz_pct_raw = self.store_settings.get("uz_overtime_percent")
@@ -777,13 +780,19 @@ class ScheduleGenerator:
                         fallback_candidates.append(e)
                 
                 if fallback_candidates:
-                    fallback_candidates.sort(
+                    within_limit = [
+                        e for e in fallback_candidates
+                        if round(e.worked_hours + shift.time_range.hours, 2) <= round(self._get_max_hours(e), 2)
+                    ]
+                    pool = within_limit if within_limit else fallback_candidates
+                    pool.sort(
                         key=lambda e: (
+                            0 if e.worked_hours < e.target_hours else 1,
                             e.worked_hours / e.target_hours if e.target_hours > 0 else float("inf"),
                             e.worked_hours,
                         )
                     )
-                    chosen = fallback_candidates[0]
+                    chosen = pool[0]
                     self._assign(chosen, shift)
                     self.logs.append(f"[KRYTYCZNE - WYMUSZONO] Awaryjnie przypisano pracownika {chosen.first_name} {chosen.last_name} do zmiany '{shift.shift_type}' ({shift.time_range.start.date()}), ignorując docelowe czasy pracy.")
                 else:
@@ -887,10 +896,11 @@ class ScheduleGenerator:
 
         for _ in range(50):
             moved = False
-            uop_emps.sort(key=lambda e: e.worked_hours / e.target_hours)
+            uop_emps.sort(key=lambda e: (0 if e.worked_hours < e.target_hours else 1, e.worked_hours / e.target_hours))
             under = uop_emps[0]
             over = uop_emps[-1]
-            if (over.worked_hours / over.target_hours) - (under.worked_hours / under.target_hours) <= 0.04:
+            both_at_or_above_target = under.worked_hours >= under.target_hours and over.worked_hours >= over.target_hours
+            if both_at_or_above_target and (over.worked_hours / over.target_hours) - (under.worked_hours / under.target_hours) <= 0.04:
                 break
 
             for strict_kp in (True, False):
@@ -903,7 +913,10 @@ class ScheduleGenerator:
                     if not (start_date <= s_date <= end_date):
                         continue
                     s_hrs = shift.time_range.hours
-                    if round(under.worked_hours + s_hrs, 2) > round(self._get_max_hours(under), 2):
+                    under_cap = max(self._get_max_hours(under), under.target_hours + 5.0)
+                    if round(under.worked_hours + s_hrs, 2) > round(under_cap, 2):
+                        continue
+                    if (over.worked_hours - s_hrs) < over.target_hours and under.worked_hours >= under.target_hours:
                         continue
                     if (over.worked_hours - s_hrs) / over.target_hours < (under.worked_hours + s_hrs) / under.target_hours - 0.01:
                         continue

@@ -893,8 +893,51 @@ class ScheduleGenerator:
         return True
 
     def _rebalance_uop_hours(self, start_date: date, end_date: date):
-        """Przenosi zmiany od pracowników UOP z nadmiarem godzin do pracowników UOP poniżej celu."""
+        """Przenosi zmiany od pracowników UZ (w nadgodzinach) lub UOP z nadmiarem do UOP poniżej celu."""
         uop_emps = [e for e in self.employees if e.is_uop and e.target_hours > 0]
+        if not uop_emps:
+            return
+
+        # Faza A: Jeśli jakikolwiek UOP ma poniżej etatu, przejmij nadmiarowe zmiany od UZ (> target_hours)
+        uz_emps = [e for e in self.employees if not e.is_uop and not e.is_franchisee and e.target_hours > 0]
+        for _ in range(50):
+            moved = False
+            under_uops = sorted([e for e in uop_emps if e.worked_hours < e.target_hours], key=lambda e: e.worked_hours / e.target_hours)
+            if not under_uops or not uz_emps:
+                break
+            uz_sorted = sorted(uz_emps, key=lambda e: e.worked_hours / e.target_hours, reverse=True)
+            for strict_kp in (True, False):
+                for under in under_uops:
+                    under_cap = max(self._get_max_hours(under), under.target_hours + 8.5)
+                    for uz_over in uz_sorted:
+                        if uz_over.worked_hours <= uz_over.target_hours:
+                            continue
+                        for shift in list(uz_over.assigned_shifts):
+                            if shift.id.startswith("prev_"):
+                                continue
+                            s_date = shift.time_range.start.date()
+                            if not (start_date <= s_date <= end_date):
+                                continue
+                            s_hrs = shift.time_range.hours
+                            if round(under.worked_hours + s_hrs, 2) > round(under_cap, 2):
+                                continue
+                            ok = self._check_non_hour_constraints(under, shift) if strict_kp else self._check_rebalance_fallback_constraints(under, shift)
+                            if ok:
+                                uz_over.assigned_shifts.remove(shift)
+                                uz_over.worked_hours -= s_hrs
+                                under.assigned_shifts.append(shift)
+                                under.worked_hours += s_hrs
+                                moved = True
+                                break
+                        if moved:
+                            break
+                    if moved:
+                        break
+                if moved:
+                    break
+            if not moved:
+                break
+
         if len(uop_emps) < 2:
             return
 

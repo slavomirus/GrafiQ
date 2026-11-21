@@ -652,6 +652,10 @@ class ScheduleGenerator:
             burn_rate = emp.worked_hours / emp.target_hours
             score += (1.0 - burn_rate) * 150.0
 
+        # 8. Priorytet UOP do osiągnięcia 100% normy etatu przed umowami zlecenie
+        if emp.is_uop and emp.target_hours > 0 and emp.worked_hours < emp.target_hours:
+            score += 120.0
+
         return score
 
     async def generate(self, start_date: date, end_date: date):

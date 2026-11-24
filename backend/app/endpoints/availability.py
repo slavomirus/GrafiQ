@@ -177,9 +177,29 @@ async def create_or_update_availability_batch(
     if not valid_availabilities:
         return []
 
-    datetime_dates = [datetime.combine(av.date, time.min) for av in valid_availabilities]
     user_id = ObjectId(current_user["_id"])
 
+    to_remove = [av for av in valid_availabilities if str(av.period_type).lower().strip() == "remove"]
+    to_upsert = [av for av in valid_availabilities if str(av.period_type).lower().strip() != "remove"]
+
+    if to_remove:
+        remove_dts = [datetime.combine(av.date, time.min) for av in to_remove]
+        existing_to_del = await db.availability.find({
+            "user_id": {"$in": [user_id, str(user_id)]},
+            "date": {"$in": remove_dts}
+        }).to_list(length=None)
+        del_ids = [doc["_id"] for doc in existing_to_del]
+        if del_ids:
+            await db.availability.delete_many({"_id": {"$in": del_ids}})
+            await db.users.update_one(
+                {"_id": user_id},
+                {"$pull": {"availability": {"$in": del_ids}}}
+            )
+
+    if not to_upsert:
+        return []
+
+    datetime_dates = [datetime.combine(av.date, time.min) for av in to_upsert]
     existing_cursor = db.availability.find({
         "user_id": user_id,
         "date": {"$in": datetime_dates}
@@ -190,7 +210,7 @@ async def create_or_update_availability_batch(
     new_availability_docs = []
     updated_ids = []
 
-    for av in valid_availabilities:
+    for av in to_upsert:
         av_datetime = datetime.combine(av.date, time.min)
         availability_data = {
             "date": av_datetime,

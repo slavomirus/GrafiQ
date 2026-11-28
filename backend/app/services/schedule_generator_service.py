@@ -344,19 +344,10 @@ class ScheduleGenerator:
                             if custom_s_str and custom_e_str and custom_s_str != "00:00":
                                 start_str, end_str = custom_s_str, custom_e_str
                                 emp.requested_shift_hours[d] = (start_str, end_str)
-                            else:
-                                start_str, end_str = resolve_shift_hours(d, mapped, self.store_settings, self.holidays_map)
-
-                            av_start = datetime.combine(d, self._parse_time(start_str))
-                            av_end = datetime.combine(d, self._parse_time(end_str))
-                            if av_end <= av_start: av_end += timedelta(days=1)
-                            
-                            # Czas PRZED dostępnością
-                            if av_start > datetime.combine(d, time.min):
-                                emp.unavailabilities.append(TimeRange(datetime.combine(d, time.min), av_start))
-                            # Czas PO dostępności
-                            if av_end < datetime.combine(d, time.max):
-                                emp.unavailabilities.append(TimeRange(av_end, datetime.combine(d, time.max)))
+                            # Uwaga: Zgłoszenie preferowanej zmiany (R, M, Z) zapisujemy w emp.requested_shifts[d].
+                            # NIE dodajemy sztucznych blokad TimeRange do emp.unavailabilities na resztę dnia,
+                            # ponieważ w niedziele (10:00-15:00) blokowało to zmianę RANEK (06:00-14:30),
+                            # a przy kolizji dwóch osób zgłaszających R zostawiało pustą zmianę ZAMKNIECIE!
 
             self.employees.append(emp)
 
@@ -710,7 +701,12 @@ class ScheduleGenerator:
             leave_hours = len(leave_dates_by_user.get(emp.id, set())) * 8.0 * emp.fte_or_target
             emp.target_hours = max(0.0, full_uop_hours * emp.fte_or_target - leave_hours)
         for emp in other_emps:
-            emp.target_hours = emp.fte_or_target
+            if emp.is_franchisee and emp.fte_or_target <= 0 and len(emp.requested_shifts) > 0:
+                # Jeśli franczyzobiorca nie wpisał limitu godzin w ustawieniach, ale podał własną dyspozycję,
+                # uwzględnij jego zgłoszone dni w grafiku
+                emp.target_hours = float(len(emp.requested_shifts)) * 8.5
+            else:
+                emp.target_hours = emp.fte_or_target
 
         # Filtruj pracowników/ajenta z 0 godzin docelowych — nie biorą udziału w grafiku
         zero_hour_employees = [e for e in self.employees if e.target_hours <= 0]
@@ -823,20 +819,26 @@ class ScheduleGenerator:
                         e for e in fallback_candidates
                         if round(e.worked_hours + shift.time_range.hours, 2) <= round(self._get_max_hours(e), 2)
                     ]
-                    if within_limit:
-                        within_limit.sort(
+                    pool_to_choose = within_limit
+                    # Dla kluczowych zmian (RANEK i ZAMKNIECIE), jeśli wszyscy przekroczyli już limit godzin,
+                    # wybierz dostępnego pracownika z najmniejszym obciążeniem, aby NIGDY nie zostawić pustej zmiany!
+                    if not pool_to_choose and shift.shift_type in critical_types and fallback_candidates:
+                        pool_to_choose = fallback_candidates
+
+                    if pool_to_choose:
+                        pool_to_choose.sort(
                             key=lambda e: (
                                 0 if e.worked_hours < e.target_hours else 1,
                                 e.worked_hours / e.target_hours if e.target_hours > 0 else float("inf"),
                                 e.worked_hours,
                             )
                         )
-                        chosen = within_limit[0]
+                        chosen = pool_to_choose[0]
                         self._assign(chosen, shift)
-                        self.logs.append(f"[KRYTYCZNE - WYMUSZONO] Awaryjnie przypisano pracownika {chosen.first_name} {chosen.last_name} do zmiany '{shift.shift_type}' ({shift.time_range.start.date()}), z zachowaniem limitu godzin.")
+                        self.logs.append(f"[KRYTYCZNE - WYMUSZONO] Awaryjnie przypisano pracownika {chosen.first_name} {chosen.last_name} do zmiany '{shift.shift_type}' ({shift.time_range.start.date()}).")
                     else:
                         date_str = shift.time_range.start.strftime("%Y-%m-%d")
-                        self.logs.append(f"[KRYTYCZNE - FATAL] Nie można obsadzić zmiany '{shift.shift_type}' w dniu {date_str} – brak dostępnego personelu w ramach limitów godzinowych (wszyscy zablokowani limitami/urlopami).")
+                        self.logs.append(f"[KRYTYCZNE - FATAL] Nie można obsadzić zmiany '{shift.shift_type}' w dniu {date_str} – brak dostępnego personelu (wszyscy na urlopie lub dniu wolnym).")
 
             # KROK 6: Wyrównanie godzin UOP
             self._rebalance_uop_hours(start_date, end_date)
@@ -927,11 +929,21 @@ class ScheduleGenerator:
         """
         try:
             closed_dates: List[date] = []
+            daily_shift_hours: Dict[str, Dict[str, Tuple[str, str]]] = {}
             curr = start_date
             while curr <= end_date:
                 d_str = curr.strftime("%Y-%m-%d")
                 if self.holidays_map.get(d_str, {}).get("is_closed"):
                     closed_dates.append(curr)
+                else:
+                    r_s, r_e = resolve_shift_hours(curr, "morning", self.store_settings, self.holidays_map)
+                    m_s, m_e = resolve_shift_hours(curr, "middle", self.store_settings, self.holidays_map)
+                    z_s, z_e = resolve_shift_hours(curr, "closing", self.store_settings, self.holidays_map)
+                    daily_shift_hours[d_str] = {
+                        schemas.SolverShiftType.RANEK.value: (r_s, r_e),
+                        schemas.SolverShiftType.SRODEK.value: (m_s, m_e),
+                        schemas.SolverShiftType.ZAMKNIECIE.value: (z_s, z_e),
+                    }
                 curr += timedelta(days=1)
 
             shift_hours_cfg = self.store_settings.get("shift_hours", {})
@@ -946,27 +958,6 @@ class ScheduleGenerator:
                     return val.strftime("%H:%M")
                 return str(val)[:5]
 
-            shifts = [
-                schemas.ShiftConfig(
-                    shift_type=schemas.SolverShiftType.RANEK,
-                    start_time=_fmt_t(m_cfg.get("start_time"), "06:00"),
-                    end_time=_fmt_t(m_cfg.get("end_time"), "14:30"),
-                    min_staff=max(1, int(self.store_settings.get("employees_per_morning_shift", 1))),
-                ),
-                schemas.ShiftConfig(
-                    shift_type=schemas.SolverShiftType.SRODEK,
-                    start_time=_fmt_t(mid_cfg.get("start_time"), "12:00"),
-                    end_time=_fmt_t(mid_cfg.get("end_time"), "20:00"),
-                    min_staff=max(0, int(self.store_settings.get("employees_per_middle_shift", 0))),
-                ),
-                schemas.ShiftConfig(
-                    shift_type=schemas.SolverShiftType.ZAMKNIECIE,
-                    start_time=_fmt_t(c_cfg.get("start_time"), "14:30"),
-                    end_time=_fmt_t(c_cfg.get("end_time"), "23:00"),
-                    min_staff=max(1, int(self.store_settings.get("employees_per_closing_shift", 1))),
-                ),
-            ]
-
             deliveries: List[schemas.DeliverySlot] = []
             for d_entry in self.store_settings.get("deliveries", []) or []:
                 if isinstance(d_entry, dict):
@@ -980,7 +971,7 @@ class ScheduleGenerator:
                                 day_of_week=int(dow),
                                 delivery_time=d_time,
                                 delivery_type=d_type,
-                                required_middle_staff=1,
+                                required_middle_staff=max(1, int(self.store_settings.get("employees_per_middle_shift", 1))),
                             )
                         )
                     for d_iso in d_dates:
@@ -990,11 +981,43 @@ class ScheduleGenerator:
                                     date=date.fromisoformat(str(d_iso)[:10]),
                                     delivery_time=d_time,
                                     delivery_type=d_type,
-                                    required_middle_staff=1,
+                                    required_middle_staff=max(1, int(self.store_settings.get("employees_per_middle_shift", 1))),
                                 )
                             )
                         except Exception:
                             pass
+
+            # Jeśli w sklepie zdefiniowano konkretny harmonogram dostaw, zmiana SRODEK jest wymagana w dni dostaw,
+            # a w pozostałe dni jej min_staff wynosi 0 (chyba że pula godzin pracowników przekracza zapotrzebowanie R+Z+dostawy)
+            raw_mid_min = max(0, int(self.store_settings.get("employees_per_middle_shift", 0)))
+            base_mid_min = 0 if deliveries else raw_mid_min
+
+            shifts = [
+                schemas.ShiftConfig(
+                    shift_type=schemas.SolverShiftType.RANEK,
+                    start_time=_fmt_t(m_cfg.get("start_time"), "06:00"),
+                    end_time=_fmt_t(m_cfg.get("end_time"), "14:30"),
+                    min_staff=max(1, int(self.store_settings.get("employees_per_morning_shift", 1))),
+                ),
+                schemas.ShiftConfig(
+                    shift_type=schemas.SolverShiftType.SRODEK,
+                    start_time=_fmt_t(mid_cfg.get("start_time"), "12:00"),
+                    end_time=_fmt_t(mid_cfg.get("end_time"), "20:00"),
+                    min_staff=base_mid_min,
+                ),
+                schemas.ShiftConfig(
+                    shift_type=schemas.SolverShiftType.ZAMKNIECIE,
+                    start_time=_fmt_t(c_cfg.get("start_time"), "14:30"),
+                    end_time=_fmt_t(c_cfg.get("end_time"), "23:00"),
+                    min_staff=max(1, int(self.store_settings.get("employees_per_closing_shift", 1))),
+                ),
+            ]
+
+            req_shift_map = {
+                schemas.ShiftType.MORNING.value: schemas.SolverShiftType.RANEK,
+                schemas.ShiftType.MIDDLE.value: schemas.SolverShiftType.SRODEK,
+                schemas.ShiftType.CLOSING.value: schemas.SolverShiftType.ZAMKNIECIE,
+            }
 
             solver_employees: List[schemas.EmployeeInput] = []
             for emp in self.employees:
@@ -1025,6 +1048,12 @@ class ScheduleGenerator:
                             )
                         )
 
+                emp_req_shifts: Dict[str, schemas.SolverShiftType] = {}
+                for r_date, r_shift_str in (emp.requested_shifts or {}).items():
+                    mapped_s = req_shift_map.get(r_shift_str)
+                    if mapped_s is not None:
+                        emp_req_shifts[r_date.isoformat()] = mapped_s
+
                 solver_employees.append(
                     schemas.EmployeeInput(
                         id=emp.id,
@@ -1039,6 +1068,7 @@ class ScheduleGenerator:
                         leaves=emp_leaves,
                         unavailability=emp_unav,
                         preferences=pref_enum,
+                        requested_shifts=emp_req_shifts,
                     )
                 )
 
@@ -1050,6 +1080,8 @@ class ScheduleGenerator:
                 deliveries=deliveries,
                 employees=solver_employees,
                 nominal_monthly_hours=full_uop_hours,
+                daily_shift_hours=daily_shift_hours,
+                strict_audit=False,
             )
 
             engine = ScheduleOptimizerEngine(req)

@@ -859,3 +859,89 @@ def test_entered_12_20_shift_hours_never_turn_into_1030_1830():
     assert schedule_doc["schedule"]["2027-01-10"]["middle"]["end_time"] == "20:00"
 
 
+def test_understaffed_store_never_skips_critical_ranek_or_zamkniecie_shifts():
+    """
+    Weryfikuje scenariusz produkcyjny (strict_audit=False), w którym:
+    - Sklep ma tylko 3 pracowników o łącznym celu godzinowym znacznie mniejszym niż
+      pełne zapotrzebowanie 3 zmian dziennie (RANEK + SRODEK + ZAMKNIECIE przez 31 dni),
+    - Dwóch pracowników zgłosiło ręczną dyspozycję na RANEK w te same dni,
+    - W niedziele obowiązują krótsze godziny (10:00-15:00 i 15:00-20:00).
+    Silnik w Kroku 3 MUSI w 100% obsadzić wszystkie zmiany kluczowe (RANEK i ZAMKNIECIE)
+    w każdym z 31 dni miesiąca, rezygnując w pierwszej kolejności ze zmian pobocznych (SRODEK)
+    i w razie konieczności przydzielając nadgodziny, zamiast zostawiać puste otwarcia/zamknięcia.
+    """
+    shifts = [
+        ShiftConfig(shift_type=SolverShiftType.RANEK, start_time="06:00", end_time="14:30", min_staff=1),
+        ShiftConfig(shift_type=SolverShiftType.SRODEK, start_time="12:00", end_time="20:00", min_staff=1),
+        ShiftConfig(shift_type=SolverShiftType.ZAMKNIECIE, start_time="14:30", end_time="23:00", min_staff=1),
+    ]
+
+    # W niedziele krótsze godziny zmian: 10:00-15:00 oraz 15:00-20:00
+    daily_shift_hours = {}
+    for day_num in range(1, 32):
+        d = date(2027, 1, day_num)
+        if d.weekday() == 6:
+            daily_shift_hours[d.isoformat()] = {
+                "RANEK": ("10:00", "15:00"),
+                "SRODEK": ("12:00", "18:00"),
+                "ZAMKNIECIE": ("15:00", "20:00"),
+            }
+
+    employees = [
+        EmployeeInput(
+            id="emp_uop",
+            first_name="Anna",
+            last_name="Kowalska",
+            contract_type=SolverContractType.UOP,
+            fte=1.0,
+            target_hours=160.0,
+            role_permissions=RolePermission.KASA_I_SKLEP,
+            requested_shifts={"2027-01-04": SolverShiftType.RANEK, "2027-01-10": SolverShiftType.RANEK},
+        ),
+        EmployeeInput(
+            id="emp_uz1",
+            first_name="Piotr",
+            last_name="Nowak",
+            contract_type=SolverContractType.UZ,
+            min_hours=0.0,
+            max_hours=120.0,
+            target_hours=100.0,
+            role_permissions=RolePermission.KASA_I_SKLEP,
+            # Kolizyjna dyspozycja na RANEK w ten sam dzień co Anna!
+            requested_shifts={"2027-01-04": SolverShiftType.RANEK, "2027-01-10": SolverShiftType.ZAMKNIECIE},
+        ),
+        EmployeeInput(
+            id="emp_uz2",
+            first_name="Kasia",
+            last_name="Wiśniewska",
+            contract_type=SolverContractType.UZ,
+            min_hours=0.0,
+            max_hours=120.0,
+            target_hours=100.0,
+            role_permissions=RolePermission.KASA,
+        ),
+    ]
+
+    request = ScheduleGenerationRequest(
+        period="2027-01",
+        shifts=shifts,
+        employees=employees,
+        daily_shift_hours=daily_shift_hours,
+        strict_audit=False,
+    )
+
+    engine = ScheduleOptimizerEngine(request)
+    response = engine.generate()
+
+    assert response.is_feasible is True
+    assert response.status in ("RELAXED", "OPTIMAL", "FEASIBLE")
+
+    # W KAŻDYM z 31 dni stycznia 2027 zmiany kluczowe RANEK i ZAMKNIECIE muszą być obsadzone!
+    for day_num in range(1, 32):
+        d_str = date(2027, 1, day_num).isoformat()
+        day_sched = response.daily_schedule[d_str]
+        assert len(day_sched["RANEK"]) >= 1, f"Pominięto zmianę kluczową RANEK w dniu {d_str}!"
+        assert len(day_sched["ZAMKNIECIE"]) >= 1, f"Pominięto zmianę kluczową ZAMKNIECIE w dniu {d_str}!"
+
+
+

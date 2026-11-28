@@ -3,7 +3,7 @@
 from pydantic import BaseModel, EmailStr, SecretStr, Field, field_validator, model_validator, field_serializer, ConfigDict
 from enum import Enum
 from datetime import date, time, datetime, timedelta
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Tuple
 from bson import ObjectId
 
 # ====================================================================
@@ -1024,6 +1024,10 @@ class EmployeeInput(BaseModel):
     leaves: List[date] = Field(default_factory=list, description="Daty urlopów i zwolnień L4")
     unavailability: List[UnavailabilitySlot] = Field(default_factory=list, description="Dni lub przedziały godzinowe braku dyspozycyjności")
     preferences: ShiftPreference = ShiftPreference.NO_PREFERENCE
+    requested_shifts: Dict[str, SolverShiftType] = Field(
+        default_factory=dict,
+        description="Mapa data (YYYY-MM-DD) -> zgłoszona zmiana z ręcznej dyspozycji pracownika"
+    )
 
     @field_validator("contract_type", mode="before")
     @classmethod
@@ -1131,6 +1135,14 @@ class ScheduleGenerationRequest(BaseModel):
     nominal_monthly_hours: Optional[float] = Field(default=None, description="Opcjonalne nadpisanie nominalnego wymiaru godzin pełnego etatu w miesiącu")
     max_solve_time_seconds: float = Field(default=10.0, ge=0.5, le=120.0)
     enforce_kp_for_uz: bool = Field(default=True, description="Czy wymuszać 11h odpoczynku i max 5 dni z rzędu również dla UZ")
+    daily_shift_hours: Dict[str, Dict[str, Tuple[str, str]]] = Field(
+        default_factory=dict,
+        description="Opcjonalne nadpisanie godzin zmian dla konkretnych dat YYYY-MM-DD (np. niedziele i święta)"
+    )
+    strict_audit: bool = Field(
+        default=True,
+        description="Czy zatrzymywać solver na Kroku 1 (Pre-walidacja) w razie wykrycia konfliktu. Gdy False, uruchamia Krok 3 (Fallback), aby zawsze obsadzić kluczowe zmiany."
+    )
 
 
 class ShiftAssignment(BaseModel):

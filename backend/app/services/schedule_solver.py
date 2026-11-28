@@ -246,11 +246,17 @@ class ScheduleOptimizerEngine:
         for d_idx, d in enumerate(self.days):
             open_day = self.is_day_open(d)
             deliveries = self._get_deliveries_for_day(d) if open_day else []
+            d_iso = d.isoformat()
+            day_custom_hours = (self.request.daily_shift_hours or {}).get(d_iso, {})
 
             for s_type in self.ALL_SHIFTS:
                 cfg = self.shift_configs[s_type]
-                start_t = cfg.start_time
-                end_t = cfg.end_time
+                custom_pair = day_custom_hours.get(s_type.value) or day_custom_hours.get(s_type)
+                if custom_pair and len(custom_pair) == 2:
+                    start_t, end_t = str(custom_pair[0])[:5], str(custom_pair[1])[:5]
+                else:
+                    start_t = cfg.start_time
+                    end_t = cfg.end_time
 
                 if not open_day:
                     specs[(d_idx, s_type)] = DayShiftSpec(
@@ -565,6 +571,8 @@ class ScheduleOptimizerEngine:
 
         # 2. Twarde ograniczenie 3 & 4: Minimalna obsada zmian, uprawnienia KASA oraz dostawy (SRODEK)
         delivery_slack_vars: Dict[int, cp_model.IntVar] = {}
+        critical_slack_vars: Dict[Tuple[int, SolverShiftType], cp_model.IntVar] = {}
+        kasa_slack_vars: Dict[Tuple[int, SolverShiftType], cp_model.IntVar] = {}
         overstaff_vars: List[cp_model.IntVar] = []
 
         for d_idx, d in enumerate(self.days):
@@ -586,10 +594,21 @@ class ScheduleOptimizerEngine:
                 ]
 
                 if s_type in (SolverShiftType.RANEK, SolverShiftType.ZAMKNIECIE):
-                    # Twardy wymóg obsady otwarcia i zamknięcia + min. 1 KASA
-                    model.Add(sum(all_assigned) >= spec.min_staff)
-                    if spec.requires_kasa:
-                        model.Add(sum(kasa_assigned) >= 1)
+                    if not relax_constraints:
+                        # Krok 2: Twardy wymóg obsady otwarcia i zamknięcia + min. 1 KASA
+                        model.Add(sum(all_assigned) >= spec.min_staff)
+                        if spec.requires_kasa:
+                            model.Add(sum(kasa_assigned) >= 1)
+                    else:
+                        # Krok 3: Najwyższy priorytet w systemie (-1_000_000 pkt za brak obsady RANEK/ZAMKNIECIE),
+                        # ale ze zmienną slack, aby 1 problematyczny dzień nie unieważniał całego miesiąca
+                        c_slack = model.NewIntVar(0, spec.min_staff, f"crit_slack_d{d_idx}_{s_type.value}")
+                        critical_slack_vars[(d_idx, s_type)] = c_slack
+                        model.Add(sum(all_assigned) + c_slack >= spec.min_staff)
+                        if spec.requires_kasa:
+                            k_slack = model.NewIntVar(0, 1, f"kasa_slack_d{d_idx}_{s_type.value}")
+                            kasa_slack_vars[(d_idx, s_type)] = k_slack
+                            model.Add(sum(kasa_assigned) + k_slack >= 1)
 
                     # Zmienna pomocnicza na ewentualną nadobsadę (tylko gdy potrzebna do wyrobienia etatu UoP)
                     over_v = model.NewIntVar(0, len(employees), f"over_d{d_idx}_{s_type.value}")
@@ -618,6 +637,7 @@ class ScheduleOptimizerEngine:
                         overstaff_vars.append(over_v)
 
         # 3. Twarde ograniczenie 5: Kodeks Pracy (11h odpoczynku, doba pracownicza, 35h tygodniowo, max 5 dni z rzędu)
+        kp_soft_penalty_terms: List[Any] = []
         for e_idx, emp in enumerate(employees):
             enforce_kp = (emp.contract_type == SolverContractType.UOP) or self.request.enforce_kp_for_uz
             if not enforce_kp:
@@ -632,30 +652,46 @@ class ScheduleOptimizerEngine:
 
                         rest_minutes = (1440 + spec2.start_min) - spec1.end_min
                         violates_11h_rest = rest_minutes < 11 * 60
-                        # Naruszenie 24-godzinnej doby pracowniczej (start kolejnego dnia wcześniej niż start dnia poprzedniego,
-                        # np. ZAMKNIECIE -> RANEK, ZAMKNIECIE -> SRODEK, SRODEK -> RANEK)
                         violates_employee_day = spec2.start_min < spec1.start_min
 
-                        if violates_11h_rest or violates_employee_day:
+                        if violates_11h_rest:
+                            # 11h odpoczynku dobowego jest ZAWSZE bezwzględnie twarde (nawet w Kroku 3)
                             model.Add(
                                 shift_vars[(e_idx, d_idx, s1)] + shift_vars[(e_idx, d_idx + 1, s2)] <= 1
                             )
+                        elif violates_employee_day:
+                            if not relax_constraints:
+                                model.Add(
+                                    shift_vars[(e_idx, d_idx, s1)] + shift_vars[(e_idx, d_idx + 1, s2)] <= 1
+                                )
+                            else:
+                                # W Kroku 3 jeśli przerwa >= 11h (np. Sobota 23:00 -> Niedziela 10:00 = 11h przerwy),
+                                # dopuszczamy ze zmienną kary, aby nie zostawić pustego otwarcia sklepu
+                                emp_day_viol = model.NewBoolVar(f"emp_day_v_e{e_idx}_d{d_idx}_{s1.value}_{s2.value}")
+                                model.Add(
+                                    shift_vars[(e_idx, d_idx, s1)] + shift_vars[(e_idx, d_idx + 1, s2)] - 1 <= emp_day_viol
+                                )
+                                kp_soft_penalty_terms.append(emp_day_viol * (-500 * SCALE))
 
             # 5b. Maksymalny ciąg dni pracy: max 5 dni z rzędu (w każdym oknie 6 dni <= 5 dni pracy)
             if num_days >= 6:
                 for w_start in range(num_days - 5):
-                    model.Add(
-                        sum(worked_day_vars[(e_idx, w_start + k)] for k in range(6)) <= 5
-                    )
+                    if not relax_constraints:
+                        model.Add(
+                            sum(worked_day_vars[(e_idx, w_start + k)] for k in range(6)) <= 5
+                        )
+                    else:
+                        consec_slack = model.NewIntVar(0, 1, f"consec_slack_e{e_idx}_w{w_start}")
+                        model.Add(
+                            sum(worked_day_vars[(e_idx, w_start + k)] for k in range(6)) - consec_slack <= 5
+                        )
+                        kp_soft_penalty_terms.append(consec_slack * (-25000 * SCALE))
 
             # 5c. 35-godzinny nieprzerwany odpoczynek tygodniowy (Art. 133 KP)
-            # W każdym 7-dniowym oknie przesuwnym musi wystąpić co najmniej 1 dzień wolny d,
-            # dla którego przerwa od końca zmiany w d-1 do początku zmiany w d+1 wynosi >= 35h (2100 min).
             if emp.contract_type == SolverContractType.UOP:
                 rest35_day_vars: List[cp_model.IntVar] = []
                 for d_idx in range(num_days):
                     r35 = model.NewBoolVar(f"rest35_e{e_idx}_d{d_idx}")
-                    # Aby dzień d dawał 35h odpoczynku, musi być dniem wolnym od pracy
                     model.Add(r35 <= 1 - worked_day_vars[(e_idx, d_idx)])
 
                     if 0 < d_idx < num_days - 1:
@@ -665,14 +701,13 @@ class ScheduleOptimizerEngine:
                                 spec2 = self.day_shifts[(d_idx + 1, s2)]
                                 rest_across_off_day = (2 * 1440 + spec2.start_min) - spec1.end_min
                                 if rest_across_off_day < 35 * 60:
-                                    # Jeśli w d-1 była zmiana s1, a w d+1 zmiana s2 z przerwą < 35h,
-                                    # to pojedynczy dzień wolny d NIE daje 35h odpoczynku
-                                    model.Add(
-                                        shift_vars[(e_idx, d_idx - 1, s1)]
-                                        + shift_vars[(e_idx, d_idx + 1, s2)]
-                                        - worked_day_vars[(e_idx, d_idx)]
-                                        <= 1
-                                    )
+                                    if not relax_constraints:
+                                        model.Add(
+                                            shift_vars[(e_idx, d_idx - 1, s1)]
+                                            + shift_vars[(e_idx, d_idx + 1, s2)]
+                                            - worked_day_vars[(e_idx, d_idx)]
+                                            <= 1
+                                        )
                                     model.Add(
                                         r35
                                         + shift_vars[(e_idx, d_idx - 1, s1)]
@@ -683,7 +718,12 @@ class ScheduleOptimizerEngine:
 
                 if num_days >= 7:
                     for w_start in range(num_days - 6):
-                        model.Add(sum(rest35_day_vars[w_start : w_start + 7]) >= 1)
+                        if not relax_constraints:
+                            model.Add(sum(rest35_day_vars[w_start : w_start + 7]) >= 1)
+                        else:
+                            w35_slack = model.NewIntVar(0, 1, f"w35_slack_e{e_idx}_w{w_start}")
+                            model.Add(sum(rest35_day_vars[w_start : w_start + 7]) + w35_slack >= 1)
+                            kp_soft_penalty_terms.append(w35_slack * (-25000 * SCALE))
 
         # 4. Twarde ograniczenie 6: Bilans godzin miesięcznych (UoP oraz UZ) + Funkcja Celu Waga 100
         actual_minutes_vars: Dict[int, cp_model.IntVar] = {}
@@ -730,20 +770,46 @@ class ScheduleOptimizerEngine:
         # FUNKCJA CELU (SOFT CONSTRAINTS)
         # ====================================================================
         objective_terms: List[Any] = []
+        objective_terms.extend(kp_soft_penalty_terms)
 
-        # 0. Kary za zmienne slack w trybie relaksacji (Krok 3)
+        # 0. Kary za zmienne slack w trybie relaksacji (Krok 3) z rygorystyczną hierarchią ważności:
+        #    1) Obsada kluczowych zmian RANEK i ZAMKNIECIE: -1_000_000 pkt (nigdy nie pomijaj otwarcia/zamknięcia!)
+        #    2) Uprawnienia KASA na RANEK/ZAMKNIECIE: -500_000 pkt
+        #    3) Obsada zmiany SRODEK w dzień dostawy: -50_000 pkt (niższy priorytet niż RANEK i ZAMKNIECIE!)
+        #    4) Obsada zwykłej zmiany SRODEK bez dostawy: -5_000 pkt
+        #    5) Przekroczenie / niedobór godzin kontraktowych: -200 pkt za minutę (-12_000 pkt za godzinę)
         if relax_constraints:
+            for (d_idx, s_type), c_slack in critical_slack_vars.items():
+                objective_terms.append(c_slack * (-1_000_000 * SCALE))
+            for (d_idx, s_type), k_slack in kasa_slack_vars.items():
+                objective_terms.append(k_slack * (-500_000 * SCALE))
             for d_idx, slack_v in delivery_slack_vars.items():
-                objective_terms.append(slack_v * (-PENALTY_SLACK_FALLBACK * SCALE))
+                is_deliv = self.day_shifts[(d_idx, SolverShiftType.SRODEK)].is_delivery_shift
+                deliv_penalty = 50_000 if is_deliv else 5_000
+                objective_terms.append(slack_v * (-deliv_penalty * SCALE))
             for e_idx in range(len(employees)):
-                # Kara proporcjonalna do każdej minuty przekroczenia zakresu [min_hours, max_hours]
-                objective_terms.append(hours_under_slack_vars[e_idx] * (-PENALTY_SLACK_FALLBACK))
-                objective_terms.append(hours_over_slack_vars[e_idx] * (-PENALTY_SLACK_FALLBACK))
+                # Kara -200 za minutę (-12_000 pkt za 1h), czyli ~102_000 pkt za zmianę 8.5h —
+                # znacznie mniej niż -1_000_000 pkt za brak obsady RANEK/ZAMKNIECIE, dzięki czemu
+                # solver ZAWSZE woli przydzielić nadgodziny niż zostawić nieobsadzone otwarcie lub zamknięcie!
+                objective_terms.append(hours_under_slack_vars[e_idx] * (-200))
+                objective_terms.append(hours_over_slack_vars[e_idx] * (-200))
 
         # 1. Waga 100 (Najwyższy priorytet miękki): Idealne trafienie w target_hours
         # -100 pkt za każdą godzinę odchylenia = -100 jednostek (w skali *60) za każdą minutę odchylenia
         for e_idx in range(len(employees)):
             objective_terms.append(abs_target_diff_vars[e_idx] * (-WEIGHT_TARGET_HOURS))
+
+        # 1b. Waga 250: Ręcznie zgłoszone dyspozycje na konkretną zmianę w danym dniu (requested_shifts)
+        for e_idx, emp in enumerate(employees):
+            if emp.requested_shifts:
+                for d_idx, d in enumerate(self.days):
+                    req_s = emp.requested_shifts.get(d.isoformat())
+                    if req_s is not None:
+                        for s_type in self.ALL_SHIFTS:
+                            if s_type == req_s:
+                                objective_terms.append(shift_vars[(e_idx, d_idx, s_type)] * (250 * SCALE))
+                            else:
+                                objective_terms.append(shift_vars[(e_idx, d_idx, s_type)] * (-80 * SCALE))
 
         # 2. Waga 50: Dopasowanie do preferencji zmianowych pracowników
         pref_map = {
@@ -892,6 +958,15 @@ class ScheduleOptimizerEngine:
         warnings: List[str] = []
         used_relaxation = False
         if relax_constraints:
+            for (d_idx, s_type), c_slack in critical_slack_vars.items():
+                missing_crit = solver.Value(c_slack)
+                if missing_crit > 0:
+                    used_relaxation = True
+                    d = self.days[d_idx]
+                    warnings.append(
+                        f"[KRYTYCZNE] W dniu {d.strftime('%d.%m')} ({d.isoformat()}) brak dostępnych pracowników "
+                        f"na kluczową zmianę {s_type.value} (wszyscy na urlopie lub dniu wolnym)."
+                    )
             for d_idx, slack_v in delivery_slack_vars.items():
                 missing = solver.Value(slack_v)
                 if missing > 0:
@@ -942,9 +1017,17 @@ class ScheduleOptimizerEngine:
         2. Rozwiązanie CP-SAT z twardymi więzami
         3. Automatyczna relaksacja (Fallback) w przypadku INFEASIBLE
         """
+        if not self.request.employees:
+            return GeneratedScheduleResponse(
+                status="INFEASIBLE",
+                is_feasible=False,
+                conflicts=["Brak pracowników w danych wejściowych do wygenerowania grafiku."],
+                warnings=[],
+            )
+
         # Krok 1: Pre-walidacja
         audit_conflicts = self.run_diagnostic_audit()
-        if audit_conflicts:
+        if audit_conflicts and self.request.strict_audit:
             return GeneratedScheduleResponse(
                 status="INFEASIBLE",
                 is_feasible=False,
@@ -952,33 +1035,37 @@ class ScheduleOptimizerEngine:
                 warnings=[],
             )
 
-        # Krok 2: Twarde więzy
-        hard_result = self._solve_cp_sat(relax_constraints=False)
-        if hard_result.is_feasible:
-            return hard_result
+        # Krok 2: Twarde więzy (tylko gdy audyt nie wykrył twardych braków kadrowych)
+        hard_solve_time = 0.0
+        if not audit_conflicts:
+            hard_result = self._solve_cp_sat(relax_constraints=False)
+            hard_solve_time = hard_result.solve_time_seconds
+            if hard_result.is_feasible:
+                return hard_result
 
-        # Krok 3: Automatyczna relaksacja (Fallback)
+        # Krok 3: Automatyczna relaksacja (Fallback) – priorytetyzuje RANEK i ZAMKNIECIE ponad wszystko
         logger.warning(
-            "Solver CP-SAT zwrócił INFEASIBLE dla twardych więzów mimo pozytywnej pre-walidacji. "
-            "Uruchamiam Krok 3: Automatyczna relaksacja (Fallback)."
+            "Uruchamiam Krok 3: Automatyczna relaksacja (Fallback) z bezwzględnym priorytetem dla zmian RANEK i ZAMKNIECIE."
         )
         relaxed_result = self._solve_cp_sat(relax_constraints=True)
         if relaxed_result.is_feasible:
+            for c_msg in audit_conflicts:
+                if c_msg not in relaxed_result.warnings:
+                    relaxed_result.warnings.insert(0, c_msg)
             if not relaxed_result.warnings:
                 relaxed_result.warnings.append(
                     "Wygenerowano grafik w trybie automatycznej relaksacji więzów miękkich/pobocznych."
                 )
             return relaxed_result
 
-        # Jeśli nawet po relaksacji dostaw i godzin UZ brak rozwiązania (np. twarda kolizja 11h odpoczynku wszystkich kasjerów)
         return GeneratedScheduleResponse(
             status="INFEASIBLE",
             is_feasible=False,
-            conflicts=[
+            conflicts=audit_conflicts or [
                 "Brak dopuszczalnego grafiku spełniającego bezwzględne wymogi 11h odpoczynku dobowego "
                 "i ciągłości obsady kasowej przy podanych dyspozycjach pracowników."
             ],
             warnings=[],
-            solve_time_seconds=hard_result.solve_time_seconds + relaxed_result.solve_time_seconds,
+            solve_time_seconds=hard_solve_time + relaxed_result.solve_time_seconds,
         )
 

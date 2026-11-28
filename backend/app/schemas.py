@@ -893,3 +893,282 @@ class ReferralCodeResponse(BaseModel):
 
     class Config(MongoConfig):
         pass
+
+
+# ====================================================================
+# Schematy dla Silnika Optymalizacyjnego CP-SAT (OR-Tools)
+# ====================================================================
+class SolverShiftType(str, Enum):
+    RANEK = "RANEK"
+    SRODEK = "SRODEK"
+    ZAMKNIECIE = "ZAMKNIECIE"
+
+
+class RolePermission(str, Enum):
+    KASA = "KASA"
+    SKLEP = "SKLEP"
+    KASA_I_SKLEP = "KASA_I_SKLEP"
+
+
+class SolverContractType(str, Enum):
+    UOP = "UOP"
+    UZ = "UZ"
+
+
+class ShiftPreference(str, Enum):
+    PREFER_RANEK = "PREFER_RANEK"
+    PREFER_SRODEK = "PREFER_SRODEK"
+    PREFER_ZAMKNIECIE = "PREFER_ZAMKNIECIE"
+    NO_PREFERENCE = "NO_PREFERENCE"
+
+
+class ShiftConfig(BaseModel):
+    shift_type: SolverShiftType
+    start_time: str = Field(..., description="Godzina rozpoczęcia w formacie HH:MM, np. 05:30")
+    end_time: str = Field(..., description="Godzina zakończenia w formacie HH:MM, np. 14:00")
+    min_staff: int = Field(default=1, ge=0, description="Minimalna obsada zmiany")
+    min_staff_by_weekday: Optional[Dict[int, int]] = Field(
+        default=None,
+        description="Opcjonalne nadpisanie minimalnej obsady dla konkretnych dni tygodnia (0=Pon..6=Niedz)"
+    )
+
+    @field_validator("shift_type", mode="before")
+    @classmethod
+    def normalize_shift_type(cls, v: Any) -> SolverShiftType:
+        if isinstance(v, SolverShiftType):
+            return v
+        s = str(v).strip().upper()
+        mapping = {
+            "RANEK": SolverShiftType.RANEK,
+            "RANO": SolverShiftType.RANEK,
+            "MORNING": SolverShiftType.RANEK,
+            "R": SolverShiftType.RANEK,
+            "SRODEK": SolverShiftType.SRODEK,
+            "ŚRODEK": SolverShiftType.SRODEK,
+            "MIDDLE": SolverShiftType.SRODEK,
+            "MID": SolverShiftType.SRODEK,
+            "M": SolverShiftType.SRODEK,
+            "ZAMKNIECIE": SolverShiftType.ZAMKNIECIE,
+            "ZAMKNIĘCIE": SolverShiftType.ZAMKNIECIE,
+            "CLOSING": SolverShiftType.ZAMKNIECIE,
+            "WIECZOR": SolverShiftType.ZAMKNIECIE,
+            "WIECZÓR": SolverShiftType.ZAMKNIECIE,
+            "Z": SolverShiftType.ZAMKNIECIE,
+        }
+        if s in mapping:
+            return mapping[s]
+        raise ValueError(f"Nieznany typ zmiany: {v}")
+
+    @field_validator("start_time", "end_time", mode="before")
+    @classmethod
+    def normalize_time_str(cls, v: Any) -> str:
+        if isinstance(v, time):
+            return v.strftime("%H:%M")
+        s = str(v).strip()
+        if len(s) >= 5:
+            return s[:5]
+        return s
+
+
+from datetime import date as DateType
+
+
+class DeliverySlot(BaseModel):
+    day_of_week: Optional[int] = Field(default=None, ge=0, le=6, description="Dzień tygodnia: 0=Poniedziałek .. 6=Niedziela")
+    date: Optional[DateType] = Field(default=None, description="Opcjonalna konkretna data dostawy YYYY-MM-DD")
+    start_time: Optional[str] = Field(default=None, description="Opcjonalny początek okna dostawy HH:MM")
+    end_time: Optional[str] = Field(default=None, description="Opcjonalny koniec okna dostawy HH:MM")
+    delivery_time: Optional[str] = Field(default=None, description="Pora dostawy z panelu admina: 'ranek' lub 'wieczór'")
+    delivery_type: Optional[str] = Field(default=None, description="Typ dostawy: 'chłodnia-mroźnia' lub 'palety-suche'")
+    required_middle_staff: int = Field(default=1, ge=1, description="Wymagana liczba pracowników na zmianie SRODEK podczas dostawy")
+    shift_start_override: Optional[str] = Field(default=None, description="Opcjonalne dostosowanie startu zmiany SRODEK w dzień dostawy")
+    shift_end_override: Optional[str] = Field(default=None, description="Opcjonalne dostosowanie końca zmiany SRODEK w dzień dostawy")
+
+    @field_validator("start_time", "end_time", mode="before")
+    @classmethod
+    def normalize_time_str(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, time):
+            return v.strftime("%H:%M")
+        s = str(v).strip()
+        return s[:5] if s else None
+
+
+class UnavailabilitySlot(BaseModel):
+    date: DateType
+    start_time: Optional[str] = Field(default=None, description="Początek niedostępności HH:MM (brak = cały dzień)")
+    end_time: Optional[str] = Field(default=None, description="Koniec niedostępności HH:MM (brak = cały dzień)")
+
+    @field_validator("start_time", "end_time", mode="before")
+    @classmethod
+    def normalize_optional_time(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, time):
+            return v.strftime("%H:%M")
+        s = str(v).strip()
+        return s[:5] if s else None
+
+
+class EmployeeInput(BaseModel):
+    id: str
+    first_name: str = ""
+    last_name: str = ""
+    contract_type: SolverContractType = SolverContractType.UOP
+    fte: Optional[float] = Field(default=1.0, ge=0.0, le=1.0, description="Wymiar etatu dla UoP (np. 1.0, 0.75, 0.5, 0.25)")
+    target_hours: Optional[float] = Field(default=None, ge=0.0, description="Cel godzinowy w miesiącu (dla UoP wyliczany automatycznie jeśli None)")
+    min_hours: Optional[float] = Field(default=None, ge=0.0, description="Minimalny limit godzin dla UZ")
+    max_hours: Optional[float] = Field(default=None, ge=0.0, description="Maksymalny limit godzin dla UZ")
+    role_permissions: RolePermission = RolePermission.KASA_I_SKLEP
+    leaves: List[date] = Field(default_factory=list, description="Daty urlopów i zwolnień L4")
+    unavailability: List[UnavailabilitySlot] = Field(default_factory=list, description="Dni lub przedziały godzinowe braku dyspozycyjności")
+    preferences: ShiftPreference = ShiftPreference.NO_PREFERENCE
+
+    @field_validator("contract_type", mode="before")
+    @classmethod
+    def normalize_contract_type(cls, v: Any) -> SolverContractType:
+        if isinstance(v, SolverContractType):
+            return v
+        s = str(v).strip().lower()
+        if s in ("uop", "umowa o pracę", "umowa o prace"):
+            return SolverContractType.UOP
+        if s in ("uz", "umowa zlecenie", "zlecenie", "b2b", "kontrakt b2b", "uod", "umowa o dzieło"):
+            return SolverContractType.UZ
+        raise ValueError(f"Nieznany typ umowy: {v}")
+
+    @field_validator("role_permissions", mode="before")
+    @classmethod
+    def normalize_role_permissions(cls, v: Any) -> RolePermission:
+        if isinstance(v, RolePermission):
+            return v
+        if isinstance(v, (list, tuple, set)):
+            roles_lower = {str(r).strip().lower() for r in v}
+            has_kasa = "kasa" in roles_lower or "kasa_i_sklep" in roles_lower
+            has_sklep = "sklep" in roles_lower or "kasa_i_sklep" in roles_lower
+            if has_kasa and has_sklep:
+                return RolePermission.KASA_I_SKLEP
+            if has_kasa:
+                return RolePermission.KASA
+            if has_sklep:
+                return RolePermission.SKLEP
+            return RolePermission.KASA_I_SKLEP
+        s = str(v).strip().upper()
+        if s in ("KASA",):
+            return RolePermission.KASA
+        if s in ("SKLEP",):
+            return RolePermission.SKLEP
+        if s in ("KASA_I_SKLEP", "ALL", "UNIWERSALNY", "BOTH"):
+            return RolePermission.KASA_I_SKLEP
+        raise ValueError(f"Nieznane uprawnienia roli: {v}")
+
+    @field_validator("unavailability", mode="before")
+    @classmethod
+    def normalize_unavailability(cls, v: Any) -> List[UnavailabilitySlot]:
+        if not v:
+            return []
+        result = []
+        for item in v:
+            if isinstance(item, UnavailabilitySlot):
+                result.append(item)
+            elif isinstance(item, date) and not isinstance(item, datetime):
+                result.append(UnavailabilitySlot(date=item))
+            elif isinstance(item, datetime):
+                result.append(UnavailabilitySlot(date=item.date()))
+            elif isinstance(item, str):
+                result.append(UnavailabilitySlot(date=date.fromisoformat(item[:10])))
+            elif isinstance(item, dict):
+                result.append(UnavailabilitySlot(**item))
+            else:
+                raise ValueError(f"Nieprawidłowy element unavailability: {item}")
+        return result
+
+    @field_validator("preferences", mode="before")
+    @classmethod
+    def normalize_preference(cls, v: Any) -> ShiftPreference:
+        if v is None:
+            return ShiftPreference.NO_PREFERENCE
+        if isinstance(v, ShiftPreference):
+            return v
+        s = str(v).strip().upper()
+        mapping = {
+            "PREFER_RANEK": ShiftPreference.PREFER_RANEK,
+            "RANEK": ShiftPreference.PREFER_RANEK,
+            "MORNING": ShiftPreference.PREFER_RANEK,
+            "RANO": ShiftPreference.PREFER_RANEK,
+            "PREFER_SRODEK": ShiftPreference.PREFER_SRODEK,
+            "SRODEK": ShiftPreference.PREFER_SRODEK,
+            "ŚRODEK": ShiftPreference.PREFER_SRODEK,
+            "MIDDLE": ShiftPreference.PREFER_SRODEK,
+            "PREFER_ZAMKNIECIE": ShiftPreference.PREFER_ZAMKNIECIE,
+            "ZAMKNIECIE": ShiftPreference.PREFER_ZAMKNIECIE,
+            "ZAMKNIĘCIE": ShiftPreference.PREFER_ZAMKNIECIE,
+            "CLOSING": ShiftPreference.PREFER_ZAMKNIECIE,
+            "NO_PREFERENCE": ShiftPreference.NO_PREFERENCE,
+            "NONE": ShiftPreference.NO_PREFERENCE,
+            "": ShiftPreference.NO_PREFERENCE,
+        }
+        return mapping.get(s, ShiftPreference.NO_PREFERENCE)
+
+
+class ScheduleGenerationRequest(BaseModel):
+    year: Optional[int] = None
+    month: Optional[int] = None
+    period: Optional[str] = Field(default=None, description="Okres rozliczeniowy YYYY-MM, np. 2027-01")
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+    # Parametry bezpośredniego uruchomienia silnika CP-SAT
+    opening_hours: Optional[Dict[str, str]] = Field(
+        default_factory=lambda: {"open": "06:00", "close": "23:00"}
+    )
+    closed_dates: List[date] = Field(default_factory=list, description="Dni całkowicie zamknięte (święta)")
+    open_all_sundays: bool = Field(default=True, description="Czy punkt jest otwarty w każdą niedzielę")
+    commercial_sundays: List[date] = Field(default_factory=list, description="Lista niedziel handlowych (jeśli open_all_sundays=False)")
+    shifts: List[ShiftConfig] = Field(default_factory=list, description="Konfiguracja 3 typów zmian: RANEK, SRODEK, ZAMKNIECIE")
+    deliveries: List[DeliverySlot] = Field(default_factory=list, description="Harmonogram dostaw wymagających obsady zmiany SRODEK")
+    employees: List[EmployeeInput] = Field(default_factory=list, description="Lista pracowników i ich parametrów")
+    nominal_monthly_hours: Optional[float] = Field(default=None, description="Opcjonalne nadpisanie nominalnego wymiaru godzin pełnego etatu w miesiącu")
+    max_solve_time_seconds: float = Field(default=10.0, ge=0.5, le=120.0)
+    enforce_kp_for_uz: bool = Field(default=True, description="Czy wymuszać 11h odpoczynku i max 5 dni z rzędu również dla UZ")
+
+
+class ShiftAssignment(BaseModel):
+    date: date
+    shift_type: SolverShiftType
+    employee_id: str
+    employee_name: str = ""
+    start_time: str
+    end_time: str
+    duration_hours: float
+    duration_minutes: int
+
+
+class EmployeeHoursSummary(BaseModel):
+    employee_id: str
+    employee_name: str = ""
+    contract_type: SolverContractType
+    fte: Optional[float] = None
+    nominal_hours: float
+    leave_days: int = 0
+    leave_hours: float = 0.0
+    target_hours: float
+    worked_hours: float
+    total_counted_hours: float
+    difference_hours: float
+    min_hours: Optional[float] = None
+    max_hours: Optional[float] = None
+    shifts_count: int = 0
+    weekend_shifts_count: int = 0
+
+
+class GeneratedScheduleResponse(BaseModel):
+    status: str = Field(..., description="OPTIMAL, FEASIBLE, RELAXED lub INFEASIBLE")
+    is_feasible: bool
+    assignments: List[ShiftAssignment] = Field(default_factory=list)
+    daily_schedule: Dict[str, Dict[str, List[str]]] = Field(default_factory=dict)
+    hours_summary: Dict[str, EmployeeHoursSummary] = Field(default_factory=dict)
+    warnings: List[str] = Field(default_factory=list)
+    conflicts: List[str] = Field(default_factory=list)
+    objective_value: Optional[float] = None
+    solve_time_seconds: float = 0.0

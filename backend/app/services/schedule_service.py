@@ -105,6 +105,19 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
         if isinstance(p_end, time): p_end = p_end.strftime("%H:%M")
         return (p_start, p_end)
 
+    # Domyślne godziny zmian skonfigurowane przez administratora
+    default_shifts = {
+        "morning": ("06:00", "14:30"),
+        "middle": ("12:00", "20:00"),
+        "closing": ("14:30", "23:00"),
+        "promo": ("14:30", "23:00")
+    }
+    shift_setting = shift_hours.get(s_type, {})
+    std_start_str = shift_setting.get("start_time", default_shifts.get(s_type, ("06:00", "14:30"))[0])
+    std_end_str = shift_setting.get("end_time", default_shifts.get(s_type, ("06:00", "14:30"))[1])
+    if isinstance(std_start_str, time): std_start_str = std_start_str.strftime("%H:%M")
+    if isinstance(std_end_str, time): std_end_str = std_end_str.strftime("%H:%M")
+
     # Logika dla dni specjalnych (święta) i niedziel
     special_day = False
     open_time_str, close_time_str = None, None
@@ -119,9 +132,9 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
         special_day = True
     elif date_obj.weekday() == 6: # Niedziela
         is_commercial = opening_hours.get("is_commercial_sunday", False)
-        # Traktuj jako handlową tylko jeśli opcja włączona ORAZ data to ustawowa niedziela handlowa
-        if is_commercial and date_obj in STATUTORY_COMMERCIAL_SUNDAYS:
-            # Jeśli niedziela handlowa, traktuj jak zwykły dzień (korzystaj z godzin weekday)
+        # Jeśli franczyzobiorca zaznaczył "Traktuj wszystkie niedziele jako niedziele handlowe"
+        # lub data wypada w ustawową niedzielę handlową -> używamy standardowych godzin zmian
+        if is_commercial or date_obj in STATUTORY_COMMERCIAL_SUNDAYS:
             weekday_settings = opening_hours.get("weekday", {})
             open_time_str = weekday_settings.get("from") or weekday_settings.get("start_time") or "06:00"
             close_time_str = weekday_settings.get("to") or weekday_settings.get("end_time") or "23:00"
@@ -129,7 +142,12 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
             sunday_settings = opening_hours.get("sunday", {})
             open_time_str = sunday_settings.get("from") or sunday_settings.get("start_time") or "10:00"
             close_time_str = sunday_settings.get("to") or sunday_settings.get("end_time") or "20:00"
-            special_day = True
+            # Traktuj jako krótszy dzień specjalny tylko jeśli godziny niedzielne są faktycznie krótsze od powszednich
+            weekday_settings = opening_hours.get("weekday", {})
+            w_open = weekday_settings.get("from") or weekday_settings.get("start_time") or "06:00"
+            w_close = weekday_settings.get("to") or weekday_settings.get("end_time") or "23:00"
+            if str(open_time_str)[:5] != str(w_open)[:5] or str(close_time_str)[:5] != str(w_close)[:5]:
+                special_day = True
 
     if special_day:
         if isinstance(open_time_str, time): open_time_str = open_time_str.strftime("%H:%M")
@@ -143,7 +161,7 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
             
         duration_total = (end_dt - start_dt).total_seconds() / 3600.0
         
-        # Dzielimy dzień na pół, aby uzyskać zmianę poranną i zamykającą
+        # Dzielimy dzień na pół, aby uzyskać zmianę poranną i zamykającą w krótsze dni świąteczne/niedzielne
         mid_dt = start_dt + timedelta(hours=duration_total / 2)
         mid_time_str = mid_dt.strftime("%H:%M")
         
@@ -152,29 +170,19 @@ def resolve_shift_hours(date_obj: date, shift_type: str, store_settings: dict, h
         elif s_type == "closing":
             return (mid_time_str, close_time_str)
         elif s_type == "middle":
-            # Dla niedzieli niehandlowej/świąt zmiana M jest bezpiecznie wyśrodkowana i wykrojona wewnątrz godzin otwarcia (nie "całka")
-            mid_span_hours = min(8.0, max(6.0, duration_total - 4.0)) if duration_total > 8.0 else max(4.0, duration_total * 0.6)
-            half_span = timedelta(hours=mid_span_hours / 2)
-            m_start_dt = max(start_dt, mid_dt - half_span)
-            m_end_dt = min(end_dt, mid_dt + half_span)
-            return (m_start_dt.strftime("%H:%M"), m_end_dt.strftime("%H:%M"))
+            # Szanujemy godziny zmiany środkowej ustawione przez admina (np. 12:00-20:00),
+            # przycinając je jedynie do godzin otwarcia punktu w ten dzień specjalny
+            std_s_dt = datetime.combine(base_date, parse_t(std_start_str))
+            std_e_dt = datetime.combine(base_date, parse_t(std_end_str))
+            if std_e_dt <= std_s_dt:
+                std_e_dt += timedelta(days=1)
+            m_start_dt = max(start_dt, std_s_dt)
+            m_end_dt = min(end_dt, std_e_dt)
+            if m_end_dt > m_start_dt:
+                return (m_start_dt.strftime("%H:%M"), m_end_dt.strftime("%H:%M"))
+            return (open_time_str, close_time_str)
         else:
-             return (open_time_str, close_time_str)
-
-    # Logika dla standardowych dni roboczych oraz niedziel handlowych/zwykłej zmiany M
-    default_shifts = {
-        "morning": ("06:00", "14:30"),
-        "middle": ("10:00", "18:00"),
-        "closing": ("14:30", "23:00"),
-        "promo": ("14:30", "23:00")
-    }
-
-    shift_setting = shift_hours.get(s_type, {})
-    std_start_str = shift_setting.get("start_time", default_shifts.get(s_type, ("06:00", "14:30"))[0])
-    std_end_str = shift_setting.get("end_time", default_shifts.get(s_type, ("06:00", "14:30"))[1])
-    
-    if isinstance(std_start_str, time): std_start_str = std_start_str.strftime("%H:%M")
-    if isinstance(std_end_str, time): std_end_str = std_end_str.strftime("%H:%M")
+            return (open_time_str, close_time_str)
 
     return (std_start_str, std_end_str)
 
@@ -222,13 +230,15 @@ def apply_shift_times(schedule_data: dict, store_settings: dict, holidays_map: d
 
                 # Sprawdzamy, czy w obiekcie (z bazy lub frontendu) wpisano już konkretne godziny
                 existing_start = shift_details.get("start_time")
+                existing_end = shift_details.get("end_time")
 
-                # Jeśli są, nie są zerami i SĄ INNE niż domyślne -> Zostawiamy w spokoju!
-                if existing_start and existing_start != "00:00" and existing_start != default_start:
-                    shift_details["is_custom"] = True
+                # Jeśli w grafiku są już zapisane poprawne godziny (różne od 00:00) -> nigdy ich nie nadpisuj!
+                if existing_start and existing_end and not (existing_start == "00:00" and existing_end == "00:00"):
+                    if existing_start != default_start or existing_end != default_end:
+                        shift_details["is_custom"] = True
                     if is_holiday:
                         shift_details["is_holiday"] = True
-                    continue  # BARDZO WAŻNE: Pomijamy nadpisywanie
+                    continue
 
                 # W przeciwnym razie nakładamy domyślne
                 shift_details["start_time"] = default_start
@@ -379,7 +389,7 @@ async def update_shift_hours(db: motor.motor_asyncio.AsyncIOMotorDatabase, shift
     })
     is_draft = False
     if not schedule:
-        schedule = await db.schedules_drafts.find_one({
+        schedule = await db.schedule_drafts.find_one({
             "_id": schedule_id,
             "franchise_code": {"$in": franchise_codes} if franchise_codes else franchise_code
         })
@@ -389,7 +399,7 @@ async def update_shift_hours(db: motor.motor_asyncio.AsyncIOMotorDatabase, shift
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Grafik nie został znaleziony.")
 
     target_franchise_code = schedule.get("franchise_code") or franchise_code
-    collection = db.schedules_drafts if is_draft else db.schedules
+    collection = db.schedule_drafts if is_draft else db.schedules
 
     # Bezpieczna serializacja czasów (obsługa time oraz string "HH:MM")
     if hasattr(shift_data.start_time, 'strftime'):
@@ -751,7 +761,7 @@ async def add_shift_to_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabase, sc
     schedule_doc = await db.schedules.find_one(sched_query)
     is_draft = False
     if not schedule_doc:
-        schedule_doc = await db.schedules_drafts.find_one(sched_query)
+        schedule_doc = await db.schedule_drafts.find_one(sched_query)
         is_draft = True
 
     if not schedule_doc:
@@ -759,7 +769,7 @@ async def add_shift_to_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabase, sc
 
     target_franchise_code = schedule_doc.get("franchise_code") or franchise_code
     sched_id = schedule_doc["_id"]
-    collection = db.schedules_drafts if is_draft else db.schedules
+    collection = db.schedule_drafts if is_draft else db.schedules
 
     day_sched = schedule_doc.get("schedule", {}).get(date_str, {})
     shift_key = shift_type
@@ -905,7 +915,7 @@ async def delete_shift_from_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabas
 
         schedule_doc = await db.schedules.find_one(sched_query)
         if not schedule_doc:
-            schedule_doc = await db.schedules_drafts.find_one(sched_query)
+            schedule_doc = await db.schedule_drafts.find_one(sched_query)
 
     if not schedule_doc and franchise_codes:
         shift_d = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -921,7 +931,7 @@ async def delete_shift_from_schedule(db: motor.motor_asyncio.AsyncIOMotorDatabas
     target_franchise_code = schedule_doc.get("franchise_code") or franchise_code
     sched_id = schedule_doc["_id"]
     is_draft = "draft_id" in schedule_doc or schedule_doc.get("status") == "DRAFT"
-    collection = db.schedules_drafts if is_draft else db.schedules
+    collection = db.schedule_drafts if is_draft else db.schedules
 
     shift_keys = [shift_name]
     if shift_name == "mid":

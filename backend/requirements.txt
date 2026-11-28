@@ -34,3 +34,7 @@ slowapi==0.1.9
 # Google Play Billing API
 google-api-python-client==2.118.0
 google-auth==2.28.0
+
+# Operations Research / CP-SAT Schedule Solver
+ortools>=9.10.0
+pytest>=8.0.0

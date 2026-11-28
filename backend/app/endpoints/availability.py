@@ -37,20 +37,36 @@ async def create_or_update_availability_unified(
         try:
             for date_str, details in payload["dates"].items():
                 start_time_obj, end_time_obj = None, None
-                if details.get("hours") and details["hours"].strip():
+                raw_type = str(details.get("type") or "").strip()
+                raw_hours = str(details.get("hours") or "").strip()
+
+                # 1. Jeśli godziny przyszły w polu 'hours' (np. "12:00 - 20:00")
+                if raw_hours:
                     try:
-                        start_str, end_str = details["hours"].split(" - ")
-                        start_time_obj = datetime.strptime(start_str.strip(), "%H:%M").time()
-                        end_time_obj = datetime.strptime(end_str.strip(), "%H:%M").time()
+                        sep = " - " if " - " in raw_hours else "-"
+                        start_str, end_str = raw_hours.split(sep)
+                        start_time_obj = datetime.strptime(start_str.strip()[:5], "%H:%M").time()
+                        end_time_obj = datetime.strptime(end_str.strip()[:5], "%H:%M").time()
                     except (ValueError, TypeError):
-                        logger.warning(f"Could not parse hours: {details.get('hours')} for date {date_str}")
+                        logger.warning(f"Could not parse hours: {raw_hours} for date {date_str}")
+
+                # 2. Jeśli godziny przyszły zaszyte w polu 'type' (np. "12:00\n20:00|mid" z ShiftModalComponent)
+                if ("\n" in raw_type or "|" in raw_type) and (start_time_obj is None or end_time_obj is None):
+                    try:
+                        time_part = raw_type.split("|")[0].strip()
+                        if "\n" in time_part:
+                            s_str, e_str = time_part.split("\n", 1)
+                            start_time_obj = datetime.strptime(s_str.strip()[:5], "%H:%M").time()
+                            end_time_obj = datetime.strptime(e_str.strip()[:5], "%H:%M").time()
+                    except Exception:
+                        pass
 
                 availabilities_to_process.append(
                     schemas.AvailabilityCreate(
                         date=date.fromisoformat(date_str),
                         start_time=start_time_obj,
                         end_time=end_time_obj,
-                        period_type=details["type"]
+                        period_type=raw_type
                     )
                 )
         except Exception as e:

@@ -8,20 +8,29 @@ from pydantic import BaseModel
 from ..database import get_db
 from ..dependencies import get_current_admin_user
 from ..services.schedule_generator_service import generate_schedule_for_period
+from ..services.schedule_solver import ScheduleOptimizerEngine
+from .. import schemas
 import motor.motor_asyncio
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-class ScheduleGenerationRequest(BaseModel):
-    year: int = None
-    month: int = None
-    start_date: str = None
-    end_date: str = None
+
+@router.post("/solve", response_model=schemas.GeneratedScheduleResponse, status_code=status.HTTP_200_OK)
+async def solve_schedule_direct_endpoint(
+    request: schemas.ScheduleGenerationRequest,
+):
+    """
+    Bezpośrednie uruchomienie silnika optymalizacyjnego Google OR-Tools (CP-SAT)
+    na przekazanej strukturze wejściowej ScheduleGenerationRequest.
+    """
+    engine = ScheduleOptimizerEngine(request)
+    return engine.generate()
+
 
 @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
 async def generate_schedule_endpoint(
-    request: ScheduleGenerationRequest,
+    request: schemas.ScheduleGenerationRequest,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_admin_user),
     db: motor.motor_asyncio.AsyncIOMotorDatabase = Depends(get_db)

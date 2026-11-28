@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from .. import models, schemas
 from .schedule_service import get_store_settings_and_holidays, resolve_shift_hours, STATUTORY_COMMERCIAL_SUNDAYS
+from .schedule_solver import ScheduleOptimizerEngine
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class Employee:
     # Input Constraints
     unavailabilities: List[TimeRange] = field(default_factory=list)
     requested_shifts: Dict[date, str] = field(default_factory=dict)
+    requested_shift_hours: Dict[date, Tuple[str, str]] = field(default_factory=dict)
     preferences: Dict[str, Any] = field(default_factory=dict) 
     
     # Stan wewnętrzny algorytmu (Solver State)
@@ -151,18 +153,21 @@ class ScheduleGenerator:
             ]
         }).to_list(length=None)
 
-        # Pobieranie zwolnień lekarskich / L4 z kolekcji leaves
-        try:
-            db_leaves = await self.db.leaves.find({
-                "user_id": {"$in": all_emp_identifiers},
-                "$or": [
-                    {"start_date": {"$lte": end_datetime}, "end_date": {"$gte": start_datetime}},
-                    {"start_date": {"$lte": end_date_str}, "end_date": {"$gte": start_date_str}}
-                ]
-            }).to_list(length=None)
-            self.db_vacations.extend(db_leaves)
-        except Exception as e:
-            logger.warning(f"Nie udało się pobrać leaves: {e}")
+        # Pobieranie zwolnień lekarskich / L4 z kolekcji leaves i sick_leaves
+        for coll_name in ("leaves", "sick_leaves"):
+            try:
+                coll = getattr(self.db, coll_name, None)
+                if coll is not None:
+                    db_leaves = await coll.find({
+                        "user_id": {"$in": all_emp_identifiers},
+                        "$or": [
+                            {"start_date": {"$lte": end_datetime}, "end_date": {"$gte": start_datetime}},
+                            {"start_date": {"$lte": end_date_str}, "end_date": {"$gte": start_date_str}}
+                        ]
+                    }).to_list(length=None)
+                    self.db_vacations.extend(db_leaves)
+            except Exception as e:
+                logger.warning(f"Nie udało się pobrać {coll_name}: {e}")
 
         # Pobieranie dyspozycji
         self.db_availabilities = await self.db.availability.find({
@@ -322,7 +327,26 @@ class ScheduleGenerator:
                         
                         if mapped:
                             emp.requested_shifts[d] = mapped
-                            start_str, end_str = resolve_shift_hours(d, mapped, self.store_settings, self.holidays_map)
+                            # Sprawdź, czy pracownik/ajent podał konkretne własne godziny (np. 12:00 - 20:00)
+                            custom_s_str, custom_e_str = None, None
+                            if start_t and end_t:
+                                custom_s_str = start_t.strftime("%H:%M") if isinstance(start_t, time) else str(start_t)[:5]
+                                custom_e_str = end_t.strftime("%H:%M") if isinstance(end_t, time) else str(end_t)[:5]
+                            elif "\n" in p_type:
+                                try:
+                                    t_part = p_type.split("|")[0].strip()
+                                    s_p, e_p = t_part.split("\n", 1)
+                                    custom_s_str = s_p.strip()[:5]
+                                    custom_e_str = e_p.strip()[:5]
+                                except Exception:
+                                    pass
+
+                            if custom_s_str and custom_e_str and custom_s_str != "00:00":
+                                start_str, end_str = custom_s_str, custom_e_str
+                                emp.requested_shift_hours[d] = (start_str, end_str)
+                            else:
+                                start_str, end_str = resolve_shift_hours(d, mapped, self.store_settings, self.holidays_map)
+
                             av_start = datetime.combine(d, self._parse_time(start_str))
                             av_end = datetime.combine(d, self._parse_time(end_str))
                             if av_end <= av_start: av_end += timedelta(days=1)
@@ -665,10 +689,26 @@ class ScheduleGenerator:
         uop_emps = [e for e in self.employees if e.is_uop]
         other_emps = [e for e in self.employees if not e.is_uop]
 
-        # Wyliczenie Puli (Art. 130 KP)
+        # Wyliczenie Puli (Art. 130 KP) z uwzględnieniem godzin urlopu / L4 dla UOP
         full_uop_hours = calculate_uop_hours(start_date.year, start_date.month, 1.0)
+        pl_holidays = holidays.Poland(years=list({start_date.year, end_date.year}))
+        leave_dates_by_user = defaultdict(set)
+        for v in self.db_vacations:
+            d_s = self._parse_date_safe(v.get("start_date"))
+            d_e = self._parse_date_safe(v.get("end_date")) or d_s
+            if not d_s or not d_e:
+                continue
+            uid = str(v.get("user_id"))
+            cur_d = max(start_date, d_s)
+            end_d = min(end_date, d_e)
+            while cur_d <= end_d:
+                if cur_d.weekday() < 5 and cur_d not in pl_holidays:
+                    leave_dates_by_user[uid].add(cur_d)
+                cur_d += timedelta(days=1)
+
         for emp in uop_emps:
-            emp.target_hours = full_uop_hours * emp.fte_or_target
+            leave_hours = len(leave_dates_by_user.get(emp.id, set())) * 8.0 * emp.fte_or_target
+            emp.target_hours = max(0.0, full_uop_hours * emp.fte_or_target - leave_hours)
         for emp in other_emps:
             emp.target_hours = emp.fte_or_target
 
@@ -678,132 +718,128 @@ class ScheduleGenerator:
             self.logs.append(f"[INFO] Pracownik/Ajent {e.first_name} {e.last_name} pominięty — docelowe godziny = 0.")
         self.employees = [e for e in self.employees if e.target_hours > 0]
 
-        # Przygotowanie slotów (klonowanie dla każdego wymaganego pracownika)
-        slots = []
-        for demand in self.demands:
-            for _ in range(demand.required_employees):
-                slots.append(ShiftDemand(
-                    id=demand.id,
-                    time_range=demand.time_range,
-                    required_employees=1,
-                    shift_type=demand.shift_type
-                ))
-            
-        # Podział na zmiany krytyczne i poboczne
-        critical_types = [schemas.ShiftType.MORNING.value, schemas.ShiftType.CLOSING.value]
-        critical_slots = sorted([s for s in slots if s.shift_type in critical_types], key=lambda x: x.time_range.start)
-        non_critical_slots = sorted([s for s in slots if s.shift_type not in critical_types], key=lambda x: x.time_range.start)
+        # KROK 1: Deterministyczny silnik optymalizacyjny Google OR-Tools (CP-SAT)
+        cp_sat_succeeded = self._run_ortools_cp_sat(start_date, end_date, leave_dates_by_user, full_uop_hours)
 
-        # Priorytetyzacja: najpierw zrób wszystkie ranki i zamknięcia, potem resztę
-        slots = critical_slots + non_critical_slots
+        if not cp_sat_succeeded:
+            # Fallback do klasycznego przydziału slotowego tylko jeśli CP-SAT zgłosił twardy brak rozwiązania
+            slots = []
+            for demand in self.demands:
+                for _ in range(demand.required_employees):
+                    slots.append(ShiftDemand(
+                        id=demand.id,
+                        time_range=demand.time_range,
+                        required_employees=1,
+                        shift_type=demand.shift_type
+                    ))
 
-        # KROK 2: Pre-assign (Requested Shifts z dyspozycji)
-        for shift in slots:
-            if shift.required_employees <= 0: continue
-            
-            shift_date = shift.time_range.start.date()
-            candidates = [
-                e for e in self.employees 
-                if e.requested_shifts.get(shift_date) == shift.shift_type 
-                and self._check_hard_constraints(e, shift)
-            ]
-            if candidates:
-                valid_candidates = []
-                for e in candidates:
-                    burn_rate = e.worked_hours / e.target_hours if e.target_hours > 0 else 1.0
-                    valid_candidates.append((e, burn_rate))
-                
-                if valid_candidates:
-                    valid_candidates.sort(key=lambda x: x[1])
-                    chosen = valid_candidates[0][0]
-                    self._assign(chosen, shift)
+            critical_types = [schemas.ShiftType.MORNING.value, schemas.ShiftType.CLOSING.value]
+            critical_slots = sorted([s for s in slots if s.shift_type in critical_types], key=lambda x: x.time_range.start)
+            non_critical_slots = sorted([s for s in slots if s.shift_type not in critical_types], key=lambda x: x.time_range.start)
+            slots = critical_slots + non_critical_slots
 
-        # KROK 3: Główny Przydział Zmian
-        for shift in slots:
-            if shift.required_employees <= 0: continue
-            
-            candidates = [
-                e for e in self.employees
-                if self._check_hard_constraints(e, shift)
-            ]
-            
-            if candidates:
-                scored_candidates = []
-                for e in candidates:
-                    burn_rate = e.worked_hours / e.target_hours if e.target_hours > 0 else 1.0
-                    score = self._calculate_soft_score(e, shift)
-                    scored_candidates.append((e, score, burn_rate))
-                
-                scored_candidates.sort(key=lambda x: x[1], reverse=True)
-                top_score = scored_candidates[0][1]
-                top_candidates = [item for item in scored_candidates if item[1] == top_score]
-                
-                top_candidates.sort(key=lambda x: x[2])
-                min_burn_rate = top_candidates[0][2]
-                best_candidates = [item for item in top_candidates if item[2] == min_burn_rate]
-                
-                chosen = random.choice(best_candidates)[0]
-                if chosen: self._assign(chosen, shift)
+            # KROK 2: Pre-assign (Requested Shifts z dyspozycji)
+            for shift in slots:
+                if shift.required_employees <= 0: continue
 
-        # KROK 5: Fallback & Alerty
-        for shift in slots:
-            if shift.required_employees > 0:
-                fallback_candidates = []
-                for e in self.employees:
-                    # Zmodyfikowane Hard Constraints (omijamy limity godzin, 
-                    # ale BEZWZGLĘDNIE ZACHOWUJEMY: urlopy, brak dostępności, 11h odpoczynek, 1 zmianę/dzień, kolejne dni)
-                    can_work = True
-                    for unav in e.unavailabilities:
-                        if unav.overlaps(shift.time_range): can_work = False
-                    for assigned in e.assigned_shifts:
-                        if assigned.time_range.overlaps(shift.time_range): can_work = False
-                        if assigned.time_range.start.date() == shift.time_range.start.date(): can_work = False
-                        if assigned.time_range.end <= shift.time_range.start:
-                            if (shift.time_range.start - assigned.time_range.end).total_seconds() / 3600.0 < 11.0: can_work = False
-                        elif shift.time_range.end <= assigned.time_range.start:
-                            if (assigned.time_range.start - shift.time_range.end).total_seconds() / 3600.0 < 11.0: can_work = False
-                    
-                    # Limit kolejnych dni pracy (nawet w fallback)
-                    if can_work:
-                        shift_date = shift.time_range.start.date()
-                        consecutive = self._count_consecutive_days(e, shift_date)
-                        max_consecutive = 6 if e.is_uop else 7
-                        if consecutive > max_consecutive:
-                            can_work = False
-                            
-                    # Nie przydzielaj zmian pracownikom/ajentowi z docelowymi 0 godzin
-                    if can_work and e.target_hours <= 0:
-                        can_work = False
-
-                    # Dla umowy zlecenie nawet w fallbacku respektuj skonfigurowany próg nadgodzin (0/25/50/60%)
-                    if can_work and not e.is_uop and not e.is_franchisee:
-                        if round(e.worked_hours + shift.time_range.hours, 2) > round(self._get_max_hours(e), 2):
-                            can_work = False
-                            
-                    if can_work:
-                        fallback_candidates.append(e)
-                
-                within_limit = [
-                    e for e in fallback_candidates
-                    if round(e.worked_hours + shift.time_range.hours, 2) <= round(self._get_max_hours(e), 2)
+                shift_date = shift.time_range.start.date()
+                candidates = [
+                    e for e in self.employees 
+                    if e.requested_shifts.get(shift_date) == shift.shift_type 
+                    and self._check_hard_constraints(e, shift)
                 ]
-                if within_limit:
-                    within_limit.sort(
-                        key=lambda e: (
-                            0 if e.worked_hours < e.target_hours else 1,
-                            e.worked_hours / e.target_hours if e.target_hours > 0 else float("inf"),
-                            e.worked_hours,
-                        )
-                    )
-                    chosen = within_limit[0]
-                    self._assign(chosen, shift)
-                    self.logs.append(f"[KRYTYCZNE - WYMUSZONO] Awaryjnie przypisano pracownika {chosen.first_name} {chosen.last_name} do zmiany '{shift.shift_type}' ({shift.time_range.start.date()}), z zachowaniem limitu godzin.")
-                else:
-                    date_str = shift.time_range.start.strftime("%Y-%m-%d")
-                    self.logs.append(f"[KRYTYCZNE - FATAL] Nie można obsadzić zmiany '{shift.shift_type}' w dniu {date_str} – brak dostępnego personelu w ramach limitów godzinowych (wszyscy zablokowani limitami/urlopami).")
+                if candidates:
+                    valid_candidates = []
+                    for e in candidates:
+                        burn_rate = e.worked_hours / e.target_hours if e.target_hours > 0 else 1.0
+                        valid_candidates.append((e, burn_rate))
 
-        # KROK 6: Wyrównanie godzin UOP (przeniesienie zmian z osób powyżej normy/wyższym % na osoby poniżej normy)
-        self._rebalance_uop_hours(start_date, end_date)
+                    if valid_candidates:
+                        valid_candidates.sort(key=lambda x: x[1])
+                        chosen = valid_candidates[0][0]
+                        self._assign(chosen, shift)
+
+            # KROK 3: Główny Przydział Zmian
+            for shift in slots:
+                if shift.required_employees <= 0: continue
+
+                candidates = [
+                    e for e in self.employees
+                    if self._check_hard_constraints(e, shift)
+                ]
+
+                if candidates:
+                    scored_candidates = []
+                    for e in candidates:
+                        burn_rate = e.worked_hours / e.target_hours if e.target_hours > 0 else 1.0
+                        score = self._calculate_soft_score(e, shift)
+                        scored_candidates.append((e, score, burn_rate))
+
+                    scored_candidates.sort(key=lambda x: x[1], reverse=True)
+                    top_score = scored_candidates[0][1]
+                    top_candidates = [item for item in scored_candidates if item[1] == top_score]
+
+                    top_candidates.sort(key=lambda x: x[2])
+                    min_burn_rate = top_candidates[0][2]
+                    best_candidates = [item for item in top_candidates if item[2] == min_burn_rate]
+
+                    chosen = random.choice(best_candidates)[0]
+                    if chosen: self._assign(chosen, shift)
+
+            # KROK 5: Fallback & Alerty
+            for shift in slots:
+                if shift.required_employees > 0:
+                    fallback_candidates = []
+                    for e in self.employees:
+                        can_work = True
+                        for unav in e.unavailabilities:
+                            if unav.overlaps(shift.time_range): can_work = False
+                        for assigned in e.assigned_shifts:
+                            if assigned.time_range.overlaps(shift.time_range): can_work = False
+                            if assigned.time_range.start.date() == shift.time_range.start.date(): can_work = False
+                            if assigned.time_range.end <= shift.time_range.start:
+                                if (shift.time_range.start - assigned.time_range.end).total_seconds() / 3600.0 < 11.0: can_work = False
+                            elif shift.time_range.end <= assigned.time_range.start:
+                                if (assigned.time_range.start - shift.time_range.end).total_seconds() / 3600.0 < 11.0: can_work = False
+
+                        if can_work:
+                            shift_date = shift.time_range.start.date()
+                            consecutive = self._count_consecutive_days(e, shift_date)
+                            max_consecutive = 6 if e.is_uop else 7
+                            if consecutive > max_consecutive:
+                                can_work = False
+
+                        if can_work and e.target_hours <= 0:
+                            can_work = False
+
+                        if can_work and not e.is_uop and not e.is_franchisee:
+                            if round(e.worked_hours + shift.time_range.hours, 2) > round(self._get_max_hours(e), 2):
+                                can_work = False
+
+                        if can_work:
+                            fallback_candidates.append(e)
+
+                    within_limit = [
+                        e for e in fallback_candidates
+                        if round(e.worked_hours + shift.time_range.hours, 2) <= round(self._get_max_hours(e), 2)
+                    ]
+                    if within_limit:
+                        within_limit.sort(
+                            key=lambda e: (
+                                0 if e.worked_hours < e.target_hours else 1,
+                                e.worked_hours / e.target_hours if e.target_hours > 0 else float("inf"),
+                                e.worked_hours,
+                            )
+                        )
+                        chosen = within_limit[0]
+                        self._assign(chosen, shift)
+                        self.logs.append(f"[KRYTYCZNE - WYMUSZONO] Awaryjnie przypisano pracownika {chosen.first_name} {chosen.last_name} do zmiany '{shift.shift_type}' ({shift.time_range.start.date()}), z zachowaniem limitu godzin.")
+                    else:
+                        date_str = shift.time_range.start.strftime("%Y-%m-%d")
+                        self.logs.append(f"[KRYTYCZNE - FATAL] Nie można obsadzić zmiany '{shift.shift_type}' w dniu {date_str} – brak dostępnego personelu w ramach limitów godzinowych (wszyscy zablokowani limitami/urlopami).")
+
+            # KROK 6: Wyrównanie godzin UOP
+            self._rebalance_uop_hours(start_date, end_date)
 
         # Mapowanie z powrotem do docelowego formatu JSON
         final_schedule_for_json = {}
@@ -820,9 +856,11 @@ class ScheduleGenerator:
             
             for shift_type in [schemas.ShiftType.MORNING.value, schemas.ShiftType.MIDDLE.value, schemas.ShiftType.CLOSING.value, schemas.ShiftType.PROMO.value]:
                 emp_list = []
+                assigned_time_range = None
                 for emp in self.employees:
                     for assigned in emp.assigned_shifts:
                         if assigned.time_range.start.date() == curr and assigned.shift_type == shift_type:
+                            assigned_time_range = assigned.time_range
                             emp_list.append({
                                 "id": emp.id,
                                 "first_name": emp.first_name,
@@ -830,7 +868,11 @@ class ScheduleGenerator:
                             })
                 
                 if emp_list:
-                    start_str, end_str = resolve_shift_hours(curr, shift_type, self.store_settings, self.holidays_map)
+                    if assigned_time_range is not None:
+                        start_str = assigned_time_range.start.strftime("%H:%M")
+                        end_str = assigned_time_range.end.strftime("%H:%M")
+                    else:
+                        start_str, end_str = resolve_shift_hours(curr, shift_type, self.store_settings, self.holidays_map)
                     final_schedule_for_json[date_str][shift_type] = {
                         "start_time": start_str,
                         "end_time": end_str,
@@ -869,7 +911,195 @@ class ScheduleGenerator:
             "created_at": datetime.utcnow()
         }
         result = await self.db.schedule_drafts.insert_one(draft_document)
-        logger.info(f"Zapisano nowy grafik roboczy z architekturą Dataclass dla {self.franchise_code} z ID: {result.inserted_id}")
+        logger.info(f"Zapisano nowy grafik roboczy z architekturą CP-SAT / Dataclass dla {self.franchise_code} z ID: {result.inserted_id}")
+
+    def _run_ortools_cp_sat(
+        self,
+        start_date: date,
+        end_date: date,
+        leave_dates_by_user: Dict[str, Set[date]],
+        full_uop_hours: float,
+    ) -> bool:
+        """
+        Buduje obiekt ScheduleGenerationRequest z danych domeny MongoDB i uruchamia
+        deterministyczny silnik optymalizacyjny Google OR-Tools (CP-SAT).
+        Zwraca True, jeśli solver wygenerował rozwiązanie (OPTIMAL, FEASIBLE lub RELAXED).
+        """
+        try:
+            closed_dates: List[date] = []
+            curr = start_date
+            while curr <= end_date:
+                d_str = curr.strftime("%Y-%m-%d")
+                if self.holidays_map.get(d_str, {}).get("is_closed"):
+                    closed_dates.append(curr)
+                curr += timedelta(days=1)
+
+            shift_hours_cfg = self.store_settings.get("shift_hours", {})
+            m_cfg = shift_hours_cfg.get("morning", {})
+            mid_cfg = shift_hours_cfg.get("middle", {})
+            c_cfg = shift_hours_cfg.get("closing", {})
+
+            def _fmt_t(val: Any, default_str: str) -> str:
+                if not val:
+                    return default_str
+                if isinstance(val, time):
+                    return val.strftime("%H:%M")
+                return str(val)[:5]
+
+            shifts = [
+                schemas.ShiftConfig(
+                    shift_type=schemas.SolverShiftType.RANEK,
+                    start_time=_fmt_t(m_cfg.get("start_time"), "06:00"),
+                    end_time=_fmt_t(m_cfg.get("end_time"), "14:30"),
+                    min_staff=max(1, int(self.store_settings.get("employees_per_morning_shift", 1))),
+                ),
+                schemas.ShiftConfig(
+                    shift_type=schemas.SolverShiftType.SRODEK,
+                    start_time=_fmt_t(mid_cfg.get("start_time"), "12:00"),
+                    end_time=_fmt_t(mid_cfg.get("end_time"), "20:00"),
+                    min_staff=max(0, int(self.store_settings.get("employees_per_middle_shift", 0))),
+                ),
+                schemas.ShiftConfig(
+                    shift_type=schemas.SolverShiftType.ZAMKNIECIE,
+                    start_time=_fmt_t(c_cfg.get("start_time"), "14:30"),
+                    end_time=_fmt_t(c_cfg.get("end_time"), "23:00"),
+                    min_staff=max(1, int(self.store_settings.get("employees_per_closing_shift", 1))),
+                ),
+            ]
+
+            deliveries: List[schemas.DeliverySlot] = []
+            for d_entry in self.store_settings.get("deliveries", []) or []:
+                if isinstance(d_entry, dict):
+                    dow = d_entry.get("day_of_week")
+                    d_dates = d_entry.get("dates") or []
+                    d_time = d_entry.get("delivery_time")
+                    d_type = d_entry.get("delivery_type")
+                    if dow is not None:
+                        deliveries.append(
+                            schemas.DeliverySlot(
+                                day_of_week=int(dow),
+                                delivery_time=d_time,
+                                delivery_type=d_type,
+                                required_middle_staff=1,
+                            )
+                        )
+                    for d_iso in d_dates:
+                        try:
+                            deliveries.append(
+                                schemas.DeliverySlot(
+                                    date=date.fromisoformat(str(d_iso)[:10]),
+                                    delivery_time=d_time,
+                                    delivery_type=d_type,
+                                    required_middle_staff=1,
+                                )
+                            )
+                        except Exception:
+                            pass
+
+            solver_employees: List[schemas.EmployeeInput] = []
+            for emp in self.employees:
+                c_type = schemas.SolverContractType.UOP if emp.is_uop else schemas.SolverContractType.UZ
+                pref_list = emp.preferences.get("preferred_shifts", [])
+                pref_enum = schemas.ShiftPreference.NO_PREFERENCE
+                if schemas.ShiftType.MORNING.value in pref_list:
+                    pref_enum = schemas.ShiftPreference.PREFER_RANEK
+                elif schemas.ShiftType.MIDDLE.value in pref_list:
+                    pref_enum = schemas.ShiftPreference.PREFER_SRODEK
+                elif schemas.ShiftType.CLOSING.value in pref_list:
+                    pref_enum = schemas.ShiftPreference.PREFER_ZAMKNIECIE
+
+                emp_leaves = sorted(leave_dates_by_user.get(emp.id, set()))
+                emp_unav: List[schemas.UnavailabilitySlot] = []
+                for tr in emp.unavailabilities:
+                    u_date = tr.start.date()
+                    if u_date in emp_leaves:
+                        continue
+                    if tr.start.time() == time.min and tr.end.time() >= time(23, 59):
+                        emp_unav.append(schemas.UnavailabilitySlot(date=u_date))
+                    else:
+                        emp_unav.append(
+                            schemas.UnavailabilitySlot(
+                                date=u_date,
+                                start_time=tr.start.strftime("%H:%M"),
+                                end_time=tr.end.strftime("%H:%M"),
+                            )
+                        )
+
+                solver_employees.append(
+                    schemas.EmployeeInput(
+                        id=emp.id,
+                        first_name=emp.first_name,
+                        last_name=emp.last_name,
+                        contract_type=c_type,
+                        fte=emp.fte_or_target if emp.is_uop else None,
+                        target_hours=emp.target_hours,
+                        min_hours=0.0 if not emp.is_uop else None,
+                        max_hours=self._get_max_hours(emp) if not emp.is_uop else None,
+                        role_permissions=emp.store_roles or "KASA_I_SKLEP",
+                        leaves=emp_leaves,
+                        unavailability=emp_unav,
+                        preferences=pref_enum,
+                    )
+                )
+
+            req = schemas.ScheduleGenerationRequest(
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat(),
+                closed_dates=closed_dates,
+                shifts=shifts,
+                deliveries=deliveries,
+                employees=solver_employees,
+                nominal_monthly_hours=full_uop_hours,
+            )
+
+            engine = ScheduleOptimizerEngine(req)
+            res = engine.generate()
+
+            for c_msg in res.conflicts:
+                self.logs.append(f"[KONFLIKT CP-SAT] {c_msg}")
+            for w_msg in res.warnings:
+                self.logs.append(f"[OSTRZEŻENIE CP-SAT] {w_msg}")
+
+            if not res.is_feasible:
+                return False
+
+            shift_type_map = {
+                schemas.SolverShiftType.RANEK: schemas.ShiftType.MORNING.value,
+                schemas.SolverShiftType.SRODEK: schemas.ShiftType.MIDDLE.value,
+                schemas.SolverShiftType.ZAMKNIECIE: schemas.ShiftType.CLOSING.value,
+            }
+            emp_by_id = {e.id: e for e in self.employees}
+            for assign in res.assignments:
+                emp_obj = emp_by_id.get(assign.employee_id)
+                if not emp_obj:
+                    continue
+                mapped_type = shift_type_map[assign.shift_type]
+                # Jeśli pracownik złożył na ten dzień własne godziny dyspozycji (np. 12:00-20:00), zachowaj je!
+                if assign.date in emp_obj.requested_shift_hours:
+                    req_s, req_e = emp_obj.requested_shift_hours[assign.date]
+                    st_dt = datetime.combine(assign.date, self._parse_time(req_s))
+                    et_dt = datetime.combine(assign.date, self._parse_time(req_e))
+                else:
+                    st_dt = datetime.combine(assign.date, self._parse_time(assign.start_time))
+                    et_dt = datetime.combine(assign.date, self._parse_time(assign.end_time))
+                if et_dt <= st_dt:
+                    et_dt += timedelta(days=1)
+                sd = ShiftDemand(
+                    id=f"{assign.date.isoformat()}_{mapped_type}",
+                    time_range=TimeRange(st_dt, et_dt),
+                    required_employees=0,
+                    shift_type=mapped_type,
+                )
+                emp_obj.assigned_shifts.append(sd)
+                emp_obj.worked_hours += sd.time_range.hours
+
+            logger.info(
+                f"Silnik OR-Tools CP-SAT wygenerował grafik ze statusem {res.status} w {res.solve_time_seconds}s"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Błąd podczas wykonywania silnika CP-SAT: {e}", exc_info=True)
+            return False
 
     def _check_rebalance_fallback_constraints(self, emp: Employee, shift: ShiftDemand) -> bool:
         """Sprawdza podstawowe bezpieczeństwo (urlopy, 1 zmiana/dzień, 11h odpoczynku, max 6 dni) przy wyrównywaniu po KROKU 5."""
